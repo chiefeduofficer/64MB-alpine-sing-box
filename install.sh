@@ -45,30 +45,24 @@ NEW_BINARY=""
 # ============================================================
 
 info() {
-    printf '[INFO
-    ] %s\n' "$*"
+    printf '[INFO] %s\n' "$*"
 }
 
 ok() {
-    printf '[ OK
-    ] %s\n' "$*"
+    printf '[ OK ] %s\n' "$*"
 }
 
 warn() {
-    printf '[WARN
-    ] %s\n' "$*" >&2
+    printf '[WARN] %s\n' "$*" >&2
 }
 
 die() {
-    printf '[ERROR
-    ] %s\n' "$*" >&2
+    printf '[ERROR] %s\n' "$*" >&2
     exit 1
 }
 
 cleanup() {
-    if [ -n "${WORK_DIR:-}"
-    ] && [ -d "$WORK_DIR"
-    ]; then
+    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         rm -rf "$WORK_DIR"
     fi
 }
@@ -80,18 +74,20 @@ trap cleanup EXIT
 # ============================================================
 
 check_environment() {
-    info "检查运行环境..."[
-        "$(id -u)" -eq 0
-    ] || die "请使用 root 运行"[ -f /etc/alpine-release
-    ] || \
+    info "检查运行环境..."
+
+    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"
+
+    [ -f /etc/alpine-release ] || \
         die "此脚本仅支持 Alpine Linux"
 
     command -v apk >/dev/null 2>&1 || \
         die "未找到 apk 包管理器"
 
     command -v rc-update >/dev/null 2>&1 || \
-        die "未找到 OpenRC rc-update"[ -x /sbin/openrc-run
-    ] || \
+        die "未找到 OpenRC rc-update"
+
+    [ -x /sbin/openrc-run ] || \
         die "未找到 /sbin/openrc-run"
 
     ok "Alpine Linux 检测通过"
@@ -162,7 +158,7 @@ prepare_workspace() {
         "${INSTALL_DIR}" \
         "${CONFIG_DIR}"
 
-    chmod 755 "${INSTALL_DIR}""${CONFIG_DIR}"
+    chmod 755 "${INSTALL_DIR}" "${CONFIG_DIR}"
 
     ok "临时目录准备完成"
 }
@@ -187,9 +183,11 @@ get_latest_release() {
         "$REPO_API" || \
         die "获取 GitHub Release 失败"
 
-    VERSION="$(jq -er '.tag_name | sub("^v"; "")' \"$release_json")" || \
-        die "无法解析版本号"[ -n "$VERSION"
-    ] || die "版本号为空"
+    VERSION="$(jq -er '.tag_name | sub("^v"; "")' \
+        "$release_json")" || \
+        die "无法解析版本号"
+
+    [ -n "$VERSION" ] || die "版本号为空"
 
     local asset_json
 
@@ -199,16 +197,15 @@ get_latest_release() {
             .assets[]
             | select(.name | startswith($prefix))
             | select(.name | endswith(".tar.gz"))
-    ]
+        ]
         | sort_by(
             if (.name | contains("musl")) then 0 else 1 end
         )
-        | .[
-        0
-    ] // empty
+        | .[0] // empty
         ' "$release_json")" || \
-        die "解析安装包信息失败"[ -n "$asset_json"
-    ] || \
+        die "解析安装包信息失败"
+
+    [ -n "$asset_json" ] || \
         die "没有找到 ${ARCH} 对应的 Linux 安装包"
 
     DOWNLOAD_URL="$(printf '%s' "$asset_json" | \
@@ -229,14 +226,7 @@ get_latest_release() {
             ;;
     esac
 
-    [
-        [
-            "$EXPECTED_SHA256" =~ ^[a-fA-F0-9
-            ]{
-                64
-            }$
-        ]
-    ] || \
+    [[ "$EXPECTED_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || \
         die "SHA256 摘要格式错误"
 
     ok "最新稳定版本: ${VERSION}"
@@ -260,8 +250,9 @@ download_package() {
         --max-time 300 \
         -o "$archive" \
         "$DOWNLOAD_URL" || \
-        die "安装包下载失败"[ -s "$archive"
-    ] || \
+        die "安装包下载失败"
+
+    [ -s "$archive" ] || \
         die "下载文件为空"
 
     ok "下载完成"
@@ -270,9 +261,9 @@ download_package() {
 
     local actual_sha256
 
-    actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"[
-        "${actual_sha256,,}" = "${EXPECTED_SHA256,,}"
-    ] || \
+    actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+
+    [ "${actual_sha256,,}" = "${EXPECTED_SHA256,,}" ] || \
         die "SHA256 校验失败，拒绝安装"
 
     ok "SHA256 校验通过"
@@ -293,13 +284,16 @@ extract_binary() {
     tar -xzf "$archive" -C "${WORK_DIR}/extract" || \
         die "解压失败"
 
-    NEW_BINARY="$(find "${WORK_DIR
-    }/extract" \
-        -type f -name sing-box -print -quit)"[ -n "$NEW_BINARY"
-] || \
-        die "没有找到 sing-box 二进制文件"[ -x "$NEW_BINARY"
-] || \
-        chmod 755 "$NEW_BINARY""$NEW_BINARY" version >/dev/null 2>&1 || \
+    NEW_BINARY="$(find "${WORK_DIR}/extract" \
+        -type f -name sing-box -print -quit)"
+
+    [ -n "$NEW_BINARY" ] || \
+        die "没有找到 sing-box 二进制文件"
+
+    [ -x "$NEW_BINARY" ] || \
+        chmod 755 "$NEW_BINARY"
+
+    "$NEW_BINARY" version >/dev/null 2>&1 || \
         die "二进制文件无法运行"
 
     ok "二进制文件检查通过"
@@ -312,28 +306,26 @@ extract_binary() {
 prepare_config() {
     info "检查配置文件..."
 
-    if [ -L "$CONFIG_FILE"
-]; then
+    if [ -L "$CONFIG_FILE" ]; then
         die "配置文件是符号链接，为安全起见停止安装"
     fi
 
-    if [ ! -f "$CONFIG_FILE"
-]; then
+    if [ ! -f "$CONFIG_FILE" ]; then
 
         info "创建默认配置文件..."
 
         cat > "${WORK_DIR}/config.json" <<'EOF'
 {
-    "log": {
-        "level": "warn"
-    },
-    "inbounds": [],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
-        }
-    ]
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
 }
 EOF
 
@@ -349,7 +341,9 @@ EOF
 
     else
 
-        info "检测到已有配置，保留原配置...""$NEW_BINARY" check -c "$CONFIG_FILE" || \
+        info "检测到已有配置，保留原配置..."
+
+        "$NEW_BINARY" check -c "$CONFIG_FILE" || \
             die "现有配置校验失败，请检查配置文件"
 
         chown root:root "$CONFIG_FILE"
@@ -373,9 +367,11 @@ install_binary() {
     local new_binary="${INSTALL_DIR}/sing-box.new"
 
     install -o root -g root -m 755 \
-        "$NEW_BINARY""$new_binary"
+        "$NEW_BINARY" "$new_binary"
 
-    mv -f "$new_binary""${INSTALL_DIR}/sing-box""${INSTALL_DIR}/sing-box" version || \
+    mv -f "$new_binary" "${INSTALL_DIR}/sing-box"
+
+    "${INSTALL_DIR}/sing-box" version || \
         die "安装后的二进制文件检查失败"
 
     ok "sing-box 安装完成"
@@ -403,14 +399,12 @@ pidfile="/run/${RC_SVCNAME}.pid"
 directory="/etc/sing-box"
 
 start_pre() {
-    if [ ! -x "$command"
-    ]; then
+    if [ ! -x "$command" ]; then
         eerror "sing-box binary not found: $command"
         return 1
     fi
 
-    if [ ! -f /etc/sing-box/config.json
-    ]; then
+    if [ ! -f /etc/sing-box/config.json ]; then
         eerror "Configuration file not found"
         return 1
     fi
@@ -437,13 +431,18 @@ EOF
 # ============================================================
 
 final_check() {
-    info "执行最终检查..."[ -x "${INSTALL_DIR}/sing-box"
-] || \
-        die "sing-box 二进制文件不存在"[ -f "$CONFIG_FILE"
-] || \
-        die "配置文件不存在"[ -x "$SERVICE_FILE"
-] || \
-        die "OpenRC 服务文件不存在""${INSTALL_DIR}/sing-box" check \
+    info "执行最终检查..."
+
+    [ -x "${INSTALL_DIR}/sing-box" ] || \
+        die "sing-box 二进制文件不存在"
+
+    [ -f "$CONFIG_FILE" ] || \
+        die "配置文件不存在"
+
+    [ -x "$SERVICE_FILE" ] || \
+        die "OpenRC 服务文件不存在"
+
+    "${INSTALL_DIR}/sing-box" check \
         -c "$CONFIG_FILE" || \
         die "最终配置校验失败"
 
