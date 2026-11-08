@@ -2,18 +2,28 @@
 #!/usr/bin/env bash
 #
 # Alpine 64MB NAT sing-box Lite Installer
-# Version: 3.0
-# Official GitHub Release + SHA256
-# Resume Download + Disk Preflight + Atomic Install + Rollback
+# Version: 3.2
 #
-# Supported:
-#   Alpine Linux / musl
-#   x86_64 / aarch64 / armv7l
+# Features:
+#   - Pipeline-safe bootstrap
+#   - Automatic dependency installation
+#   - Alpine / musl detection
+#   - AMD64 / ARM64 / ARMv7
+#   - GitHub latest stable release
+#   - Resume download and retry
+#   - Official SHA256 verification
+#   - Archive structure verification
+#   - Disk space preflight
+#   - Atomic installation
+#   - Automatic rollback
+#   - Installation lock
+#   - Automatic cleanup
 #
-# Install:
+# Usage:
+#   wget -qO- URL | bash
 #   bash install.sh
 #
-# No automatic service startup.
+# Does NOT automatically start sing-box.
 
 set -Eeuo pipefail
 umask 077
@@ -22,17 +32,20 @@ umask 077
 # Configuration
 # ============================================================
 
+VERSION_SCRIPT="3.2"
+
 REPO="SagerNet/sing-box"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
 DEST="/usr/local/bin/sing-box"
 WORK="/root/.singbox-install"
 
+LOCK_DIR="/run/sing-box-installer.lock"
+
 MAX_RETRIES=3
 CONNECT_TIMEOUT=15
 DOWNLOAD_TIMEOUT=1800
 
-# Reserve disk space for filesystem overhead.
 DISK_RESERVE=$((1024 * 1024))
 
 # ============================================================
@@ -67,95 +80,94 @@ die() {
 TMP=""
 ARCHIVE=""
 META=""
+OUT=""
 NEW=""
 BACKUP=""
 
+ARCH=""
+LIBC="musl"
+
+RELEASE=""
+VERSION=""
+ASSET=""
+URL=""
+EXPECTED_DIGEST=""
+ASSET_SIZE=""
+
+ENTRY=""
+
+LOCKED=0
 ROLLBACK_ACTIVE=0
 HAD_OLD=0
+PRESERVE_BACKUP=0
 
 # ============================================================
-# Cleanup and rollback
+# Bootstrap
 # ============================================================
 
-cleanup() {
-    local rc=$?
-
-    trap - EXIT INT TERM
-
-    if [ "$ROLLBACK_ACTIVE" -eq 1 ]; then
-        warn "检测到安装未完成，执行回滚..."
-
-        rm -f "$DEST"
-
-        if [ "$HAD_OLD" -eq 1 ] && [ -f "$BACKUP" ]; then
-            if mv -f "$BACKUP" "$DEST"; then
-                ok "旧版本已恢复"
-            else
-                err "回滚失败！备份文件保留在: $BACKUP"
-                rc=1
-            fi
-        else
-            warn "原先不存在旧版本，已清除不完整安装"
-        fi
-    fi
-
-    [ -n "$NEW" ] && rm -f "$NEW"
-    [ -n "$BACKUP" ] && rm -f "$BACKUP"
-
-    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
-        rm -rf "$TMP"
-    fi
-
-    exit "$rc"
-}
-
-on_signal() {
-    local signal="$1"
-
-    case "$signal" in
-        INT)  exit 130 ;;
-        TERM) exit 143 ;;
-    esac
-}
-
-trap cleanup EXIT
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
-
-# ============================================================
-# Environment checks
-# ============================================================
-
-check_environment() {
+bootstrap() {
     info "检查运行环境..."
 
-    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"
+    [ "$(id -u)" -eq 0 ] || \
+        die "请使用 root 运行"
 
     [ -f /etc/alpine-release ] || \
         die "此脚本仅支持 Alpine Linux"
 
-    local deps=(
-        bash curl jq tar sha256sum
-        awk sed head wc df
-        uname mkdir chmod cp mv rm
-        mktemp sleep dirname
-    )
+    command -v apk >/dev/null 2>&1 || \
+        die "未找到 Alpine apk 包管理器"
 
-    local missing=()
+    info "检查依赖..."
 
-    for cmd in "${deps[@]}"; do
-        command -v "$cmd" >/dev/null 2>&1 || \
-            missing+=("$cmd")
+    local packages=()
+    local cmd
+
+    for cmd in curl jq tar sha256sum; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            case "$cmd" in
+                curl)      packages+=(curl) ;;
+                jq)        packages+=(jq) ;;
+                tar)       packages+=(tar) ;;
+                sha256sum) packages+=(coreutils) ;;
+            esac
+        fi
     done
 
-    if [ "${#missing[@]}" -gt 0 ]; then
-        err "缺少依赖: ${missing[*]}"
-        err "请执行:"
-        err "apk add --no-cache bash curl jq tar coreutils"
-        exit 1
+    if [ "${#packages[@]}" -gt 0 ]; then
+        info "安装缺失依赖: ${packages[*]}"
+
+        apk add --no-cache "${packages[@]}" || \
+            die "依赖安装失败"
     fi
 
-    ok "环境检查通过"
+    for cmd in curl jq tar sha256sum awk sed head wc df mktemp uname grep; do
+        command -v "$cmd" >/dev/null 2>&1 || \
+            die "缺少必要命令: $cmd"
+    done
+
+    ok "依赖检查完成"
+    ok "当前 Shell: Bash ${BASH_VERSION}"
+}
+
+# ============================================================
+# Installation lock
+# ============================================================
+
+acquire_lock() {
+    info "获取安装锁..."
+
+    mkdir -p /run
+
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        die "另一个安装任务可能正在运行。
+如确认没有安装任务，请检查锁目录: $LOCK_DIR"
+    fi
+
+    LOCKED=1
+
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+
+    ok "安装锁已获取"
 }
 
 # ============================================================
@@ -164,6 +176,7 @@ check_environment() {
 
 detect_arch() {
     local machine
+
     machine="$(uname -m)"
 
     case "$machine" in
@@ -181,15 +194,39 @@ detect_arch() {
             ;;
     esac
 
-    LIBC="musl"
-
     info "系统: Alpine Linux"
-    info "架构: ${ARCH}"
-    info "C 库: ${LIBC}"
+    info "架构: $ARCH"
+    info "C 库: $LIBC"
+
+    ok "架构识别完成"
 }
 
 # ============================================================
-# Disk space checking
+# Workspace
+# ============================================================
+
+prepare_workspace() {
+    info "准备临时工作目录..."
+
+    mkdir -p "$WORK"
+    chmod 700 "$WORK"
+
+    TMP="$(mktemp -d "$WORK/sb-install.XXXXXX")"
+
+    ARCHIVE="$TMP/sing-box.tar.gz"
+    META="$TMP/release.json"
+    OUT="$TMP/sing-box"
+
+    mkdir -p "$(dirname "$DEST")"
+
+    NEW="$(dirname "$DEST")/.sing-box.new.$$"
+    BACKUP="$(dirname "$DEST")/.sing-box.backup.$$"
+
+    ok "临时目录: $TMP"
+}
+
+# ============================================================
+# Disk space
 # ============================================================
 
 available_bytes() {
@@ -213,38 +250,14 @@ check_disk_space() {
 
     info "磁盘检查: $path"
     info "需要空间: $((required / 1024 / 1024)) MB"
-    info "剩余空间: $((available / 1024 / 1024)) MB"
+    info "可用空间: $((available / 1024 / 1024)) MB"
 
-    if [ "$available" -lt "$required" ]; then
+    [ "$available" -ge "$required" ] || \
         die "磁盘空间不足: $path"
-    fi
 }
 
 # ============================================================
-# Prepare working directory
-# ============================================================
-
-prepare_workspace() {
-    info "准备临时目录..."
-
-    mkdir -p "$WORK"
-    mkdir -p "$(dirname "$DEST")"
-
-    chmod 700 "$WORK"
-
-    TMP="$(mktemp -d "$WORK/sb-install.XXXXXX")"
-
-    ARCHIVE="$TMP/sing-box.tar.gz"
-    META="$TMP/release.json"
-
-    NEW="$(dirname "$DEST")/.sing-box.new.$$"
-    BACKUP="$(dirname "$DEST")/.sing-box.backup.$$"
-
-    ok "临时目录: $TMP"
-}
-
-# ============================================================
-# HTTP helper
+# GitHub API
 # ============================================================
 
 http_get() {
@@ -258,20 +271,16 @@ http_get() {
         --retry-delay 2 \
         --retry-connrefused \
         -H "Accept: application/vnd.github+json" \
-        -H "User-Agent: Alpine-sing-box-Installer-V3" \
+        -H "User-Agent: Alpine-sing-box-Lite-Installer" \
         "$url" \
         -o "$output"
 }
-
-# ============================================================
-# Fetch release information
-# ============================================================
 
 fetch_release() {
     info "获取 GitHub 最新稳定版..."
 
     http_get "$API" "$META" || \
-        die "无法获取 GitHub Release 信息"
+        die "获取 GitHub Release 失败"
 
     RELEASE="$(
         jq -er '
@@ -282,7 +291,7 @@ fetch_release() {
             )
             | .tag_name
         ' "$META"
-    )" || die "无法识别稳定版版本号"
+    )" || die "无法识别最新稳定版"
 
     VERSION="${RELEASE#v}"
 
@@ -297,21 +306,21 @@ fetch_release() {
     )"
 
     [ "$count" = "1" ] || \
-        die "没有找到唯一的官方安装包: $ASSET"
+        die "未找到对应架构的官方安装包: $ASSET"
 
     URL="$(
         jq -er --arg name "$ASSET" '
             .assets[] | select(.name == $name) |
             .browser_download_url
         ' "$META"
-    )" || die "无法读取安装包下载地址"
+    )" || die "无法读取下载地址"
 
     EXPECTED_DIGEST="$(
         jq -er --arg name "$ASSET" '
             .assets[] | select(.name == $name) |
             .digest
         ' "$META"
-    )" || die "GitHub 未提供 SHA256 摘要"
+    )" || die "GitHub Release 没有提供 SHA256 摘要"
 
     ASSET_SIZE="$(
         jq -er --arg name "$ASSET" '
@@ -320,10 +329,12 @@ fetch_release() {
         ' "$META"
     )" || die "无法读取安装包大小"
 
-    EXPECTED_URL="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
+    local expected_url
 
-    [ "$URL" = "$EXPECTED_URL" ] || \
-        die "下载地址校验失败"
+    expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
+
+    [ "$URL" = "$expected_url" ] || \
+        die "下载地址验证失败"
 
     [[ "$EXPECTED_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || \
         die "官方 SHA256 格式无效"
@@ -338,41 +349,42 @@ fetch_release() {
 
     info "版本: $VERSION"
     info "安装包: $ASSET"
-    info "下载大小: $((ASSET_SIZE / 1024 / 1024)) MB"
+    info "大小: $((ASSET_SIZE / 1024 / 1024)) MB"
 
     ok "Release 信息验证通过"
 }
 
 # ============================================================
-# Download with resume and retry
+# Download with resume
 # ============================================================
 
+download_once() {
+    curl -fLsS \
+        -C - \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$DOWNLOAD_TIMEOUT" \
+        --retry 0 \
+        --progress-bar \
+        -H "User-Agent: Alpine-sing-box-Lite-Installer" \
+        "$URL" \
+        -o "$ARCHIVE"
+}
+
 download_release() {
-    info "检查下载目录空间..."
+    info "检查下载空间..."
 
     check_disk_space "$WORK" \
-        "$((ASSET_SIZE + DISK_RESERVE))"
+        "$((ASSET_SIZE * 3 + DISK_RESERVE))"
 
     local attempt
     local current_size
 
-    info "开始下载官方安装包..."
+    info "开始下载..."
 
     for ((attempt = 1; attempt <= MAX_RETRIES; attempt++)); do
-
         info "下载尝试 ${attempt}/${MAX_RETRIES}"
 
-        # -C - automatically resumes from existing file size.
-        if curl -fLsS \
-            -C - \
-            --connect-timeout "$CONNECT_TIMEOUT" \
-            --max-time "$DOWNLOAD_TIMEOUT" \
-            --retry 0 \
-            --progress-bar \
-            -H "User-Agent: Alpine-sing-box-Installer-V3" \
-            "$URL" \
-            -o "$ARCHIVE"; then
-
+        if download_once; then
             break
         fi
 
@@ -382,27 +394,25 @@ download_release() {
             current_size="$(wc -c < "$ARCHIVE")"
         fi
 
-        # HTTP 416 can occur if the previous transfer
-        # already completed. Verify size before accepting.
         if [ "$current_size" -eq "$ASSET_SIZE" ]; then
             break
         fi
 
-        warn "下载中断，准备继续续传..."
+        warn "下载中断，保留已下载部分并重试"
 
-        if [ "$attempt" -lt "$MAX_RETRIES" ]; then
-            sleep 2
-        fi
+        [ "$attempt" -lt "$MAX_RETRIES" ] && \
+            sleep "$((attempt * 2))"
     done
 
-    [ -f "$ARCHIVE" ] || \
+    [ -f "$ARCHIVE" ] || {
+        rm -f "$ARCHIVE"
         die "下载文件不存在"
+    }
 
     current_size="$(wc -c < "$ARCHIVE")"
 
-    # If resume failed, make one clean retry sequence.
     if [ "$current_size" -ne "$ASSET_SIZE" ]; then
-        warn "续传未完成，尝试重新下载..."
+        warn "续传未完成，重新下载..."
 
         rm -f "$ARCHIVE"
 
@@ -413,7 +423,7 @@ download_release() {
             --retry-delay 2 \
             --retry-connrefused \
             --progress-bar \
-            -H "User-Agent: Alpine-sing-box-Installer-V3" \
+            -H "User-Agent: Alpine-sing-box-Lite-Installer" \
             "$URL" \
             -o "$ARCHIVE" || \
             die "重新下载失败"
@@ -422,9 +432,9 @@ download_release() {
     current_size="$(wc -c < "$ARCHIVE")"
 
     [ "$current_size" -eq "$ASSET_SIZE" ] || \
-        die "文件大小不匹配"
+        die "安装包大小不匹配"
 
-    ok "下载完成，文件大小正确"
+    ok "下载完成"
 }
 
 # ============================================================
@@ -445,42 +455,49 @@ verify_archive() {
 }
 
 # ============================================================
-# Extract binary
+# Archive verification
 # ============================================================
 
 extract_binary() {
-    info "正在提取 sing-box..."
+    info "检查压缩包结构..."
 
     ENTRY="sing-box-${VERSION}-linux-${ARCH}-musl/sing-box"
 
-    rm -f "$NEW"
+    # FIX 1:
+    # Avoid tar | grep -q pipeline and pipefail issues.
+    tar -tzf "$ARCHIVE" > "$TMP/archive.list" || \
+        die "压缩包目录读取失败"
 
-    if ! tar -xzf "$ARCHIVE" -O "$ENTRY" > "$NEW"; then
-        rm -f "$NEW"
-        die "解压 sing-box 失败"
+    grep -Fxq "$ENTRY" "$TMP/archive.list" || \
+        die "压缩包中没有找到目标二进制"
+
+    info "提取 sing-box..."
+
+    if ! tar -xzf "$ARCHIVE" -O "$ENTRY" > "$OUT"; then
+        die "提取二进制失败"
     fi
 
-    [ -s "$NEW" ] || \
-        die "提取的二进制文件为空"
+    [ -s "$OUT" ] || \
+        die "提取的二进制为空"
 
-    chmod 755 "$NEW"
+    chmod 755 "$OUT"
 
-    if ! "$NEW" version >/dev/null 2>&1; then
-        die "二进制无法运行，可能存在架构或 musl 兼容性问题"
+    if ! "$OUT" version >/dev/null 2>&1; then
+        die "二进制无法运行，可能存在架构或 musl 兼容问题"
     fi
 
     local actual_version
 
     actual_version="$(
-        "$NEW" version 2>/dev/null |
+        "$OUT" version 2>/dev/null |
         sed -n 's/^sing-box version \([^ ]*\).*/\1/p' |
         head -n 1
     )"
 
     [ "$actual_version" = "$VERSION" ] || \
-        die "二进制版本不匹配"
+        die "二进制版本验证失败"
 
-    ok "二进制验证通过"
+    ok "二进制结构和版本验证通过"
 }
 
 # ============================================================
@@ -492,55 +509,54 @@ install_preflight() {
     local old_size=0
     local required
 
-    new_size="$(wc -c < "$NEW")"
+    new_size="$(wc -c < "$OUT")"
 
     if [ -f "$DEST" ]; then
         old_size="$(wc -c < "$DEST")"
     fi
 
-    # Space for new binary and old-version backup.
     required="$((new_size + old_size + DISK_RESERVE))"
 
     info "检查安装目录空间..."
 
     check_disk_space "$(dirname "$DEST")" "$required"
 
-    info "新版本大小: $((new_size / 1024 / 1024)) MB"
-
-    ok "安装空间充足"
+    ok "安装目录空间充足"
 }
 
 # ============================================================
-# Atomic installation with rollback
+# Atomic installation
 # ============================================================
 
 install_binary() {
     info "开始安装..."
 
     if [ -e "$DEST" ]; then
-        info "检测到旧版本，创建回滚备份..."
+        [ -f "$DEST" ] || \
+            die "目标路径存在，但不是普通文件"
 
         cp -p "$DEST" "$BACKUP" || \
-            die "创建旧版本备份失败"
+            die "备份旧版本失败"
 
         HAD_OLD=1
 
         ok "旧版本备份完成"
-    else
-        HAD_OLD=0
-        info "未检测到旧版本"
     fi
 
-    # Enable rollback before replacing the destination.
+    cp "$OUT" "$NEW" || \
+        die "复制新版本失败"
+
+    chmod 755 "$NEW"
+
+    if ! "$NEW" version >/dev/null 2>&1; then
+        die "安装前二次验证失败"
+    fi
+
     ROLLBACK_ACTIVE=1
 
-    # NEW and DEST are in the same filesystem.
     mv -f "$NEW" "$DEST" || \
-        die "替换安装文件失败"
+        die "原子替换失败"
 
-    chmod 755 "$DEST"
-
-    # Verify installed executable.
     if ! "$DEST" version >/dev/null 2>&1; then
         die "安装后验证失败"
     fi
@@ -554,17 +570,79 @@ install_binary() {
     )"
 
     [ "$installed_version" = "$VERSION" ] || \
-        die "安装后版本验证失败"
+        die "安装后的版本号不匹配"
 
-    # Commit installation.
-    if [ "$HAD_OLD" -eq 1 ]; then
-        rm -f "$BACKUP" || \
-            die "安装成功但无法清理旧版本备份"
-    fi
-
+    # FIX 2:
+    # Commit transaction BEFORE removing backup.
+    # Backup cleanup failure must not trigger rollback.
     ROLLBACK_ACTIVE=0
 
+    if [ "$HAD_OLD" -eq 1 ]; then
+        if ! rm -f "$BACKUP"; then
+            warn "安装成功，但旧版本备份未能清理: $BACKUP"
+        fi
+    fi
+
     ok "安装成功"
+}
+
+# ============================================================
+# Cleanup and rollback
+# ============================================================
+
+cleanup() {
+    local rc=$?
+
+    trap - EXIT INT TERM
+
+    if [ "$ROLLBACK_ACTIVE" -eq 1 ]; then
+        warn "安装未完成，正在回滚..."
+
+        if [ "$HAD_OLD" -eq 1 ] && [ -f "$BACKUP" ]; then
+            if mv -f "$BACKUP" "$DEST"; then
+                ok "旧版本恢复成功"
+            else
+                err "回滚失败，保留备份: $BACKUP"
+                PRESERVE_BACKUP=1
+                rc=1
+            fi
+        else
+            if ! rm -f "$DEST"; then
+                err "无法清除不完整安装文件"
+                rc=1
+            else
+                warn "已清除不完整的新版本"
+            fi
+        fi
+    fi
+
+    [ -n "$NEW" ] && rm -f "$NEW"
+
+    if [ "$PRESERVE_BACKUP" -eq 0 ]; then
+        [ -n "$BACKUP" ] && rm -f "$BACKUP"
+    fi
+
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+        rm -rf "$TMP"
+    fi
+
+    if [ "$LOCKED" -eq 1 ]; then
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+
+    exit "$rc"
+}
+
+on_signal() {
+    local signal="$1"
+
+    warn "收到中断信号: $signal"
+
+    case "$signal" in
+        INT)  exit 130 ;;
+        TERM) exit 143 ;;
+    esac
 }
 
 # ============================================================
@@ -572,11 +650,9 @@ install_binary() {
 # ============================================================
 
 main() {
-    info "========================================"
-    info " Alpine sing-box Lite Installer V3"
-    info "========================================"
+    bootstrap
 
-    check_environment
+    acquire_lock
 
     detect_arch
 
@@ -595,97 +671,37 @@ main() {
     install_binary
 
     echo
-    info "========================================"
-    ok "sing-box 安装完成！"
-    info "========================================"
+    echo "========================================"
+    ok "sing-box 安装完成"
+    echo "========================================"
 
-    echo "版本: $VERSION"
-    echo "架构: $ARCH"
-    echo "C库: musl"
-    echo "路径: $DEST"
-    echo "校验: SHA256 OK"
-    echo "回滚: 已提交"
-    echo "服务: 未自动启动"
+    echo "Installer : V${VERSION_SCRIPT}"
+    echo "Version   : ${VERSION}"
+    echo "Architecture: ${ARCH}"
+    echo "Library   : ${LIBC}"
+    echo "Binary    : ${DEST}"
+    echo "SHA256    : VERIFIED"
+    echo "Rollback  : COMMITTED"
+    echo "Service   : NOT STARTED"
 
     echo "----------------------------------------"
 
     "$DEST" version
 
     echo
-    ok "V3 安装流程全部完成"
+    ok "V3.2 全部安装流程完成"
 }
 
+# ============================================================
+# Traps
+# ============================================================
+
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 # ============================================================
-# Bootstrap: install dependencies automatically
+# Entry
 # ============================================================
 
-bootstrap() {
-    echo
-    echo "========================================"
-    echo " Alpine sing-box Lite Installer V3"
-    echo "========================================"
-
-    [ "$(id -u)" -eq 0 ] || {
-        echo "[ERROR] 请使用 root 执行"
-        exit 1
-    }
-
-    [ -f /etc/alpine-release ] || {
-        echo "[ERROR] 仅支持 Alpine Linux"
-        exit 1
-    }
-
-    echo "[INFO] 检查并安装依赖..."
-
-    if ! command -v apk >/dev/null 2>&1; then
-        echo "[ERROR] 未找到 apk"
-        exit 1
-    fi
-
-    REQUIRED_PACKAGES="bash curl jq tar coreutils"
-
-    MISSING=""
-
-    for pkg in $REQUIRED_PACKAGES; do
-        case "$pkg" in
-            bash)      cmd=bash ;;
-            curl)      cmd=curl ;;
-            jq)        cmd=jq ;;
-            tar)       cmd=tar ;;
-            coreutils) cmd=sha256sum ;;
-        esac
-
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            MISSING="$MISSING $pkg"
-        fi
-    done
-
-    if [ -n "$MISSING" ]; then
-        echo "[INFO] 安装缺失依赖:$MISSING"
-
-        apk add --no-cache $MISSING || {
-            echo "[ERROR] 依赖安装失败"
-            exit 1
-        }
-    fi
-
-    echo "[OK] 依赖检查完成"
-
-    # Re-execute using Bash when invoked through sh.
-    if [ -z "${BASH_VERSION:-}" ]; then
-        exec bash "$0" "$@"
-    fi
-
-    # Verify complete script syntax.
-    bash -n "$0" || {
-        echo "[ERROR] 脚本语法检查失败"
-        exit 1
-    }
-
-    echo "[OK] Bash 语法检查通过"
-}
-
-bootstrap "$@"
 main "$@"
-
