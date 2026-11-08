@@ -1,192 +1,106 @@
+
 #!/usr/bin/env bash
-# Alpine 64MB NAT sing-box Lite Installer
-# Version: 3.2 (Repaired; automatic config initialization)
+
+# ============================================================
+# sing-box Alpine Linux Installer
+# Version: 4.0
+# Platform: Alpine Linux / musl
+# Architectures: amd64 / arm64 / armv7
+# Service: OpenRC
+#
+# Install path: /usr/local/bin/sing-box
+# Config path:  /etc/sing-box/config.json
+# Service path: /etc/init.d/sing-box
+#
+# IMPORTANT:
+# - Stable release only
+# - SHA256 verification required
+# - Existing config will not be overwritten
+# - Enable OpenRC startup
+# - DO NOT start service automatically
+# ============================================================
 
 set -Eeuo pipefail
-umask 077
 
-# ============================================================
-# Configuration
-# ============================================================
-VERSION_SCRIPT="3.2"
-REPO="SagerNet/sing-box"
-API="https://api.github.com/repos/${REPO}/releases/latest"
+readonly REPO_API="https://api.github.com/repos/SagerNet/sing-box"
+readonly INSTALL_DIR="/usr/local/bin"
+readonly CONFIG_DIR="/etc/sing-box"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly SERVICE_FILE="/etc/init.d/sing-box"
 
-DEST="/usr/local/bin/sing-box"
-WORK="/root/.singbox-install"
-LOCK_DIR="/run/sing-box-installer.lock"
-
-CONFIG_DIR="/etc/sing-box"
-CONFIG="${CONFIG_DIR}/config.json"
-
-MAX_RETRIES=3
-CONNECT_TIMEOUT=15
-DOWNLOAD_TIMEOUT=1800
-DISK_RESERVE=$((1024 * 1024))
+WORK_DIR=""
+ARCH=""
+VERSION=""
+DOWNLOAD_URL=""
+EXPECTED_SHA256=""
 
 # ============================================================
 # Logging
 # ============================================================
-info() { printf '[INFO
-  ] %s\n' "$*";
-}
-ok()   { printf '[OK
-  ]   %s\n' "$*";
-}
-warn() { printf '[WARN
-  ] %s\n' "$*" >&2;
-}
-err()  { printf '[ERROR
-  ] %s\n' "$*" >&2;
-}
-die()  { err "$*"; exit 1;
-}
 
-# ============================================================
-# Global state
-# ============================================================
-TMP=""
-ARCHIVE=""
-META=""
-OUT=""
-NEW=""
-BACKUP=""
-CONFIG_TMP=""
+info() {
+    printf '\033[
+        36m[INFO
+        ]\033[
+            0m %s\n' "$*"
+        }
 
-ARCH=""
-LIBC="musl"
+ok() {
+    printf '\033[
+                32m[ OK
+                ]\033[
+                    0m %s\n' "$*"
+                }
 
-RELEASE=""
-VERSION=""
-ASSET=""
-URL=""
-EXPECTED_DIGEST=""
-ASSET_SIZE=""
-ENTRY=""
+warn() {
+    printf '\033[
+                        33m[WARN
+                        ]\033[
+                            0m %s\n' "$*" >&2
+                        }
 
-LOCKED=0
-ROLLBACK_ACTIVE=0
-HAD_OLD=0
+die() {
+    printf '\033[
+                                31m[ERROR
+                                ]\033[
+                                    0m %s\n' "$*" >&2
+    exit 1
+                                }
 
-# ============================================================
-# Exit handling
-# ============================================================
-on_exit() {
-    local status=$?
-
-    trap - EXIT INT TERM
-    set +e
-
-    if [
-    "$ROLLBACK_ACTIVE" -eq 1
-  ]; then
-        warn "安装未完整成功，正在回滚 sing-box 二进制..."
-
-        if [
-    "$HAD_OLD" -eq 1
-  ] && [ -f "$BACKUP"
-  ]; then
-            mv -f "$BACKUP""$DEST"
-            ok "已恢复旧版本"
-        else
-            rm -f "$DEST"
-            ok "已移除未完成安装的二进制"
-        fi
+cleanup() {
+    if [ -n "${WORK_DIR:-}"
+                                    ] && [ -d "$WORK_DIR"
+                                    ]; then
+        rm -rf "$WORK_DIR"
     fi
+                                }
 
-    [ -n "$NEW"
-  ] && rm -f "$NEW"[ -n "$BACKUP"
-  ] && rm -f "$BACKUP"[ -n "$CONFIG_TMP"
-  ] && rm -f "$CONFIG_TMP"[ -n "$TMP"
-  ] && rm -rf "$TMP"
-
-    if [
-    "$LOCKED" -eq 1
-  ]; then
-        rm -rf "$LOCK_DIR"
-    fi
-
-    exit "$status"
-}
-
-trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap cleanup EXIT
 
 # ============================================================
-# Bootstrap
+# Environment checks
 # ============================================================
-bootstrap() {
+
+check_environment() {
     info "检查运行环境..."[
-    "$(id -u)" -eq 0
-  ] || die "请使用 root 运行"[ -f /etc/alpine-release
-  ] || die "此脚本仅支持 Alpine Linux"
+                                        "$(id -u)" -eq 0
+                                    ] || die "请使用 root 运行"[ -f /etc/alpine-release
+                                    ] || \
+        die "此脚本仅支持 Alpine Linux"
 
     command -v apk >/dev/null 2>&1 || \
-        die "未找到 Alpine apk 包管理器"
+        die "未找到 apk 包管理器"
 
-    info "检查依赖..."
+    command -v rc-update >/dev/null 2>&1 || \
+        die "未找到 OpenRC rc-update"[ -x /sbin/openrc-run
+                                    ] || \
+        die "未找到 /sbin/openrc-run"
 
-    local packages=()
-    local cmd
+    ok "Alpine Linux 环境检测通过"
 
-    for cmd in curl jq tar sha256sum; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            case "$cmd" in
-                curl)      packages+=(curl) ;;
-                jq)        packages+=(jq) ;;
-                tar)       packages+=(tar) ;;
-                sha256sum) packages+=(coreutils) ;;
-            esac
-        fi
-    done
+    info "检查 CPU 架构..."
 
-    if [
-    "${#packages[@]}" -gt 0
-  ]; then
-        info "安装缺失依赖: ${packages[*]}"
-
-        apk add --no-cache "${packages[@]}" || \
-            die "依赖安装失败"
-    fi
-
-    for cmd in curl jq tar sha256sum awk sed head wc df mktemp uname grep sleep; do
-        command -v "$cmd" >/dev/null 2>&1 || \
-            die "缺少必要命令: $cmd"
-    done
-
-    ok "依赖检查完成"
-    ok "当前 Shell: Bash ${BASH_VERSION}"
-}
-
-# ============================================================
-# Installation lock
-# ============================================================
-acquire_lock() {
-    info "获取安装锁..."
-
-    mkdir -p /run
-
-    if ! mkdir "$LOCK_DIR"2>/dev/null; then
-        die "另一个安装任务可能正在运行。请检查锁目录: $LOCK_DIR"
-    fi
-
-    LOCKED=1
-
-    printf '%s\n' "$$" > "$LOCK_DIR/pid"
-
-    ok "安装锁已获取"
-}
-
-# ============================================================
-# Architecture detection
-# ============================================================
-detect_arch() {
-    local machine
-
-    machine="$(uname -m)"
-
-    case "$machine" in
+    case "$(uname -m)" in
         x86_64|amd64)
             ARCH="amd64"
             ;;
@@ -197,459 +111,386 @@ detect_arch() {
             ARCH="armv7"
             ;;
         *)
-            die "不支持的 CPU 架构: $machine"
+            die "不支持的 CPU 架构: $(uname -m)"
             ;;
     esac
 
-    info "系统: Alpine Linux"
-    info "架构: $ARCH"
-    info "C 库: $LIBC"
-
-    ok "架构识别完成"
-}
+    ok "CPU 架构: ${ARCH}"
+                                }
 
 # ============================================================
-# Workspace
+# Install dependencies
 # ============================================================
+
+install_dependencies() {
+    info "安装必要依赖..."
+
+    apk add --no-cache \
+        ca-certificates \
+        wget \
+        tar \
+        jq \
+        coreutils
+
+    update-ca-certificates >/dev/null 2>&1 || true
+
+    command -v wget >/dev/null 2>&1 || \
+        die "wget 安装失败"
+
+    command -v jq >/dev/null 2>&1 || \
+        die "jq 安装失败"
+
+    command -v sha256sum >/dev/null 2>&1 || \
+        die "sha256sum 不可用"
+
+    ok "依赖安装完成"
+                                }
+
+# ============================================================
+# Prepare temporary directory
+# ============================================================
+
 prepare_workspace() {
-    info "准备临时工作目录..."
+    WORK_DIR="$(mktemp -d /tmp/sing-box-install.XXXXXX)" || \
+        die "无法创建临时目录"
 
-    mkdir -p "$WORK"
-    chmod 700 "$WORK"
+    mkdir -p \
+        "${WORK_DIR}/extract" \
+        "${INSTALL_DIR}" \
+        "${CONFIG_DIR}"
 
-    TMP="$(mktemp -d "$WORK/sb-install.XXXXXX")"
-
-    ARCHIVE="$TMP/sing-box.tar.gz"
-    META="$TMP/release.json"
-    OUT="$TMP/sing-box"
-
-    mkdir -p "$(dirname "$DEST")"
-
-    NEW="$(dirname "$DEST")/.sing-box.new.$$"
-    BACKUP="$(dirname "$DEST")/.sing-box.backup.$$"
-
-    ok "临时目录: $TMP"
-}
+    chmod 755 "${INSTALL_DIR}""${CONFIG_DIR}"
+                                }
 
 # ============================================================
-# Disk space
+# Get latest stable release
 # ============================================================
-available_bytes() {
-    local path="$1"
-    local kb
 
-    kb="$(df -Pk "$path" | awk 'END {print $4}')"[
+get_latest_release() {
+    info "获取 sing-box 最新稳定版..."
+
+    local release_json="${WORK_DIR}/release.json"
+
+    wget -q \
+        --timeout=20 \
+        --tries=3 \
+        --header="Accept: application/vnd.github+json" \
+        --header="X-GitHub-Api-Version: 2022-11-28" \
+        -O "$release_json" \
+        "${REPO_API}/releases/latest" || \
+        die "获取 GitHub Release 信息失败"
+
+    VERSION="$(jq -er '.tag_name | sub("^v"; "")' \"$release_json")" || \
+        die "无法解析 sing-box 版本号"[ -n "$VERSION"
+                                    ] || die "版本号为空"
+
+    # 选择对应架构的 Linux tar.gz 文件。
+    # 如果存在 musl 后缀版本，优先选择 musl 版本。
+
+    local asset_json
+
+    asset_json="$(jq -cer \
+        --arg version "$VERSION" \
+        --arg arch "$ARCH" '
+        [
+            .assets[]
+            | select(
+                (.name | startswith(
+                    "sing-box-" + $version + "-linux-" + $arch
+                ))
+                and
+                (.name | endswith(".tar.gz"))
+            )
+                                    ]
+        | sort_by(
+            if (.name | contains("musl")) then 0 else 1 end
+        )
+        | .[
+                                        0
+                                    ] // empty
+        ' "$release_json")" || \
+        die "没有找到对应架构的官方安装包"
+
+    DOWNLOAD_URL="$(printf '%s' "$asset_json" | jq -er '.browser_download_url')" || \
+        die "无法获取安装包下载地址"
+
+    local digest
+
+    digest="$(printf '%s' "$asset_json" | jq -r '.digest // empty')"
+
+    case "$digest" in
+        sha256:*)
+            EXPECTED_SHA256="${digest#sha256:}"
+            ;;
+        *)
+            die "GitHub Release 未提供有效 SHA256 摘要，停止安装"
+            ;;
+    esac
+
     [
-      "$kb" =~ ^[
-        0-9
-      ]+$
-    ]
-  ] || \
-        die "无法读取磁盘剩余空间: $path"
+                                        [
+                                            "$EXPECTED_SHA256" =~ ^[a-fA-F0-9
+                                            ]{
+                                                64
+                                            }$
+                                        ]
+                                    ] || \
+        die "SHA256 摘要格式错误"
 
-    printf '%s\n' "$((kb * 1024))"
-}
-
-check_disk_space() {
-    local path="$1"
-    local required="$2"
-    local available
-
-    available="$(available_bytes "$path")"
-
-    info "磁盘检查: $path"
-    info "需要空间: $((required / 1024 / 1024)) MB"
-    info "可用空间: $((available / 1024 / 1024)) MB"[
-    "$available" -ge "$required"
-  ] || \
-        die "磁盘空间不足: $path"
-}
+    ok "最新稳定版: ${VERSION}"
+    ok "目标架构: ${ARCH}"
+                                }
 
 # ============================================================
-# GitHub API
+# Download package
 # ============================================================
-http_get() {
-    local url="$1"
-    local output="$2"
 
-    curl -fLsS \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time 120 \
-        --retry 3 \
-        --retry-delay 2 \
+download_package() {
+    info "下载 sing-box..."
+
+    local archive="${WORK_DIR}/sing-box.tar.gz"
+
+    wget \
+        --timeout=30 \
+        --tries=3 \
         --retry-connrefused \
-        -H "Accept: application/vnd.github+json" \
-        -H "User-Agent: Alpine-sing-box-Lite-Installer" \
-        "$url" -o "$output"
-}
-
-fetch_release() {
-    info "获取 GitHub 最新稳定版..."
-
-    http_get "$API""$META" || \
-        die "获取 GitHub Release 失败"
-
-    RELEASE="$(jq -er '
-        select(.draft == false and .prerelease == false)
-        | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
-        | .tag_name
-    ' "$META")" || die "无法识别最新稳定版"
-
-    VERSION="${RELEASE#v}"
-
-    ASSET="sing-box-${VERSION}-linux-${ARCH}-musl.tar.gz"
-
-    local count expected_url
-
-    count="$(jq --arg name "$ASSET" \
-        '[.assets[] | select(.name == $name)
-  ] | length' "$META")"["$count" = "1"
-] || \
-        die "未找到对应架构的官方安装包: $ASSET"
-
-    URL="$(jq -er --arg name "$ASSET" \
-        '.assets[] | select(.name == $name) | .browser_download_url' \
-        "$META")" || die "无法读取下载地址"
-
-    EXPECTED_DIGEST="$(jq -er --arg name "$ASSET" \
-        '.assets[] | select(.name == $name) | .digest' \
-        "$META")" || die "GitHub Release 没有提供 SHA256 摘要"
-
-    ASSET_SIZE="$(jq -er --arg name "$ASSET" \
-        '.assets[] | select(.name == $name) | .size' \
-        "$META")" || die "无法读取安装包大小"
-
-    expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"[
-  "$URL" = "$expected_url"
-] || \
-        die "下载地址验证失败"[
-  [
-    "$EXPECTED_DIGEST" =~ ^sha256: [a-fA-F0-9
-    ]{
-      64
-    }$
-  ]
-] || \
-        die "官方 SHA256 格式无效"[
-  [
-    "$ASSET_SIZE" =~ ^[
-      0-9
-    ]+$
-  ]
-] || \
-        die "安装包大小无效"[
-  "$ASSET_SIZE" -gt 0
-] || \
-        die "安装包大小为零"
-
-    EXPECTED_DIGEST="${EXPECTED_DIGEST#sha256:}"
-
-    info "版本: $VERSION"
-    info "安装包: $ASSET"
-    info "大小: $((ASSET_SIZE / 1024 / 1024)) MB"
-
-    ok "Release 信息验证通过"
-}
-
-# ============================================================
-# Download with resume and retry
-# ============================================================
-download_once() {
-    curl -fLsS -C - \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time "$DOWNLOAD_TIMEOUT" \
-        --retry 0 \
-        --progress-bar \
-        -H "User-Agent: Alpine-sing-box-Lite-Installer" \
-        "$URL" -o "$ARCHIVE"
-}
-
-download_release() {
-    info "检查下载空间..."
-
-    check_disk_space "$WORK" \
-        "$((ASSET_SIZE * 3 + DISK_RESERVE))"
-
-    local attempt
-    local current_size
-
-    : > "$ARCHIVE"
-
-    info "开始下载..."
-
-    for ((attempt = 1; attempt <= MAX_RETRIES; attempt++)); do
-        info "下载尝试 ${attempt}/${MAX_RETRIES}"
-
-        if download_once; then
-            current_size="$(wc -c < "$ARCHIVE")"[
-  "$current_size" -eq "$ASSET_SIZE"
-] && break
-        fi
-
-        current_size="$(wc -c < "$ARCHIVE" 2>/dev/null || printf '0')"
-
-        if [
-  "$current_size" -gt "$ASSET_SIZE"
-]; then
-            rm -f "$ARCHIVE": > "$ARCHIVE"
-        fi
-
-        if [
-  "$attempt" -lt "$MAX_RETRIES"
-]; then
-            warn "下载中断，保留已下载部分并重试"
-            sleep "$((attempt * 2))"
-        fi
-    done
-
-    current_size="$(wc -c < "$ARCHIVE")"
-
-    if [
-  "$current_size" -ne "$ASSET_SIZE"
-]; then
-        warn "续传未完成，尝试重新下载..."
-
-        rm -f "$ARCHIVE"
-
-        curl -fLsS \
-            --connect-timeout "$CONNECT_TIMEOUT" \
-            --max-time "$DOWNLOAD_TIMEOUT" \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-connrefused \
-            --progress-bar \
-            -H "User-Agent: Alpine-sing-box-Lite-Installer" \
-            "$URL" -o "$ARCHIVE" || \
-            die "重新下载失败"
-    fi
-
-    current_size="$(wc -c < "$ARCHIVE")"[
-  "$current_size" -eq "$ASSET_SIZE"
-] || \
-        die "安装包大小不匹配"
+        -O "$archive" \
+        "$DOWNLOAD_URL" || \
+        die "安装包下载失败"[ -s "$archive"
+                                    ] || die "下载文件为空"
 
     ok "下载完成"
-}
 
-# ============================================================
-# SHA256 verification
-# ============================================================
-verify_archive() {
-    info "正在校验 SHA256..."
+    info "验证 SHA256..."
 
-    local actual
+    local actual_sha256
 
-    actual="$(sha256sum "$ARCHIVE" | awk '{print $1}')"[
-  "${actual,,}" = "${EXPECTED_DIGEST,,}"
-] || \
+    actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"[
+                                        "${actual_sha256,,}" = "${EXPECTED_SHA256,,}"
+                                    ] || \
         die "SHA256 校验失败，拒绝安装"
 
     ok "SHA256 校验通过"
-}
+                                }
 
 # ============================================================
-# Archive verification and extraction
+# Extract and verify binary
 # ============================================================
+
 extract_binary() {
-    info "检查压缩包结构..."
+    info "解压安装包..."
 
-    ENTRY="sing-box-${VERSION}-linux-${ARCH}-musl/sing-box"
+    local archive="${WORK_DIR}/sing-box.tar.gz"
 
-    tar -tzf "$ARCHIVE" > "$TMP/archive.list" || \
-        die "压缩包目录读取失败"
+    tar -tzf "$archive" >/dev/null 2>&1 || \
+        die "安装包损坏或不是有效的 gzip tar 文件"
 
-    grep -Fxq "$ENTRY""$TMP/archive.list" || \
-        die "压缩包中没有找到目标二进制"
+    tar -xzf "$archive" -C "${WORK_DIR}/extract" || \
+        die "安装包解压失败"
 
-    info "提取 sing-box..."
+    local binary
 
-    tar -xzf "$ARCHIVE" -O "$ENTRY" > "$OUT" || \
-        die "提取二进制失败"[ -s "$OUT"
-] || \
-        die "提取的二进制为空"
+    binary="$(find "${WORK_DIR
+                                    }/extract" \
+        -type f -name sing-box -print -quit)"[ -n "$binary"
+                                    ] && [ -x "$binary"
+                                    ] || \
+        die "安装包中没有找到可执行的 sing-box""$binary" version >/dev/null 2>&1 || \
+        die "sing-box 二进制文件无法运行"
 
-    chmod 755 "$OUT""$OUT" version >/dev/null 2>&1 || \
-        die "二进制无法运行，可能存在架构或 musl 兼容问题"
+    ok "二进制文件检查通过"
 
-    local actual_version
-
-    actual_version="$("$OUT" version 2>/dev/null |
-        sed -n 's/^sing-box version \([^
-]*\).*/\1/p' |
-        head -n 1
-    )"["$actual_version" = "$VERSION"
-] || \
-        die "二进制版本验证失败"
-
-    ok "二进制结构和版本验证通过"
-}
+    NEW_BINARY="$binary"
+                                }
 
 # ============================================================
-# Installation preflight
+# Prepare configuration
 # ============================================================
-install_preflight() {
-    local new_size
-    local old_size=0
-    local required
 
-    new_size="$(wc -c < "$OUT")"
+prepare_config() {
+    info "检查 sing-box 配置..."
 
-    if [ -f "$DEST"
-]; then
-        old_size="$(wc -c < "$DEST")"
+    local default_config="${WORK_DIR}/config.json"
+
+    if [ ! -f "$CONFIG_FILE"
+                                    ]; then
+
+        cat > "$default_config" <<'EOF'
+{
+                                        "log": {
+                                            "level": "warn"
+                                        },
+                                        "inbounds": [],
+                                        "outbounds": [
+                                            {
+                                                "type": "direct",
+                                                "tag": "direct"
+                                            }
+                                        ],
+                                        "route": {
+                                            "final": "direct"
+                                        }
+                                    }
+EOF
+
+        chmod 600 "$default_config""$NEW_BINARY" check -c "$default_config" || \
+            die "默认配置文件校验失败"
+
+        install -o root -g root -m 600 \
+            "$default_config""$CONFIG_FILE"
+
+        ok "默认配置文件创建成功"
+
+    else
+
+        "$NEW_BINARY" check -c "$CONFIG_FILE" || \
+            die "现有配置文件校验失败，请先检查配置"
+
+        chmod 600 "$CONFIG_FILE"
+        chown root:root "$CONFIG_FILE"
+
+        ok "保留现有配置文件"
+
     fi
 
-    required="$((new_size + old_size + DISK_RESERVE))"
-
-    info "检查安装目录空间..."
-
-    check_disk_space "$(dirname "$DEST")""$required"
-
-    ok "安装目录空间充足"
-}
-
-# ============================================================
-# Configuration initialization
-# ============================================================
-initialize_config() {
-    info "初始化 sing-box 配置目录..."
-
-    mkdir -p "$CONFIG_DIR"
     chown root:root "$CONFIG_DIR"
     chmod 755 "$CONFIG_DIR"
-
-    if [ -L "$CONFIG"
-]; then
-        die "配置文件路径是符号链接，拒绝覆盖: $CONFIG"
-    fi
-
-    if [ -e "$CONFIG"
-] && [ ! -f "$CONFIG"
-]; then
-        die "配置文件路径存在但不是普通文件: $CONFIG"
-    fi
-
-    if [ ! -f "$CONFIG"
-]; then
-        info "生成默认 config.json..."
-
-        CONFIG_TMP="$(mktemp "$CONFIG_DIR/.config.json.XXXXXX")"
-
-        cat > "$CONFIG_TMP" <<'JSON'
-{
-"log": {
-  "level": "info",
-  "timestamp": true
-},
-"inbounds": [],
-"outbounds": [
-  {
-    "type": "direct",
-    "tag": "direct"
-  }
-],
-"route": {
-  "final": "direct"
-}
-}
-JSON
-
-        chown root:root "$CONFIG_TMP"
-        chmod 600 "$CONFIG_TMP""$DEST" check -c "$CONFIG_TMP" || \
-            die "默认配置校验失败"
-
-        mv -f "$CONFIG_TMP""$CONFIG"
-        CONFIG_TMP=""
-
-        ok "config.json 创建成功"
-    else
-        info "检测到已有配置文件，保留原配置"
-    fi
-
-    chown root:root "$CONFIG"
-    chmod 600 "$CONFIG""$DEST" check -c "$CONFIG" || \
-        die "sing-box 配置文件校验失败"
-
-    ok "配置文件校验通过"
-}
+                                }
 
 # ============================================================
-# Atomic installation with rollback
+# Install binary
 # ============================================================
+
 install_binary() {
-    info "开始安装..."
+    info "安装 sing-box..."
 
-    if [ -e "$DEST"
-]; then
-        [ -f "$DEST"
-] || \
-            die "目标路径存在，但不是普通文件"
+    local new_binary="${INSTALL_DIR}/sing-box.new"
 
-        cp -p "$DEST""$BACKUP" || \
-            die "备份旧版本失败"
+    install -o root -g root -m 755 \
+        "$NEW_BINARY""$new_binary"
 
-        HAD_OLD=1
+    mv -f "$new_binary""${INSTALL_DIR}/sing-box""${INSTALL_DIR}/sing-box" version || \
+        die "安装后的 sing-box 无法运行"
 
-        ok "旧版本备份完成"
+    ok "sing-box 安装完成"
+                                }
+
+# ============================================================
+# Configure OpenRC service
+# ============================================================
+
+configure_openrc_service() {
+    info "创建 OpenRC 服务..."
+
+    cat > "$SERVICE_FILE" <<'EOF'
+#!/sbin/openrc-run
+
+name="sing-box"
+description="sing-box service"
+
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+directory="/etc/sing-box"
+
+start_pre() {
+    if [ ! -x "$command"
+                                        ]; then
+        eerror "sing-box binary not found: $command"
+        return 1
     fi
 
-    cp "$OUT""$NEW" || \
-        die "复制新版本失败"
+    if [ ! -f /etc/sing-box/config.json
+                                        ]; then
+        eerror "Configuration file not found"
+        return 1
+    fi
 
-    chmod 755 "$NEW""$NEW" version >/dev/null 2>&1 || \
-        die "安装前二次验证失败"
+    "$command" check -c /etc/sing-box/config.json
+                                    }
+EOF
 
-    # 启用失败回滚
-    ROLLBACK_ACTIVE=1
+    chmod 755 "$SERVICE_FILE"
+    chown root:root "$SERVICE_FILE"
 
-    mv -f "$NEW""$DEST" || \
-        die "替换 sing-box 二进制失败"
+    ok "OpenRC 服务脚本创建成功"
 
-    ok "sing-box 二进制已安装"
+    info "设置 OpenRC 开机启动..."
 
-    # 自动初始化配置
-    initialize_config
+    rc-update add sing-box default || \
+        die "设置 OpenRC 开机启动失败"
 
-    # 安装提交成功
-    ROLLBACK_ACTIVE=0
+    ok "已设置开机启动"
+                                }
 
-    rm -f "$BACKUP"
+# ============================================================
+# Final verification
+# ============================================================
 
-    ok "sing-box 安装及配置初始化完成"
-}
+final_check() {
+    info "执行最终检查..."[ -x "${INSTALL_DIR}/sing-box"
+                                    ] || \
+        die "sing-box 二进制文件不存在"[ -f "$CONFIG_FILE"
+                                    ] || \
+        die "配置文件不存在"[ -x "$SERVICE_FILE"
+                                    ] || \
+        die "OpenRC 服务脚本不存在""${INSTALL_DIR}/sing-box" check -c "$CONFIG_FILE" || \
+        die "最终配置检查失败"
 
-
+    echo
+    echo "========================================"
+    echo "         sing-box 安装完成"
+    echo "========================================"
+    echo
+    echo "版本:       ${VERSION}"
+    echo "架构:       ${ARCH}"
+    echo "二进制:     ${INSTALL_DIR}/sing-box"
+    echo "配置文件:   ${CONFIG_FILE}"
+    echo "服务文件:   ${SERVICE_FILE}"
+    echo
+    echo "配置权限:   600"
+    echo "目录权限:   755"
+    echo "开机启动:   已设置"
+    echo "当前状态:   未启动"
+    echo
+    echo "手动启动:"
+    echo "  rc-service sing-box start"
+    echo
+    echo "查看状态:"
+    echo "  rc-service sing-box status"
+    echo
+    echo "查看日志:"
+    echo "  tail -f /var/log/messages"
+    echo
+    echo "========================================"
+    echo
+    ok "安装成功！服务没有自动启动。"
+                                }
 
 # ============================================================
 # Main
 # ============================================================
+
 main() {
-    bootstrap
-    acquire_lock
-    detect_arch
-    prepare_workspace
-    fetch_release
-    download_release
-    verify_archive
-    extract_binary
-    install_preflight
-    install_binary
-   
-
-    echo "--------------------------------"
-    echo "脚本版本: $VERSION_SCRIPT"
-    echo "sing-box 版本: $VERSION"
-    echo "架构: $ARCH"
-    echo "程序: $DEST"
-    echo "配置: $CONFIG"
-    echo "目录权限: 755 (root:root)"
-    echo "文件权限: 600 (root:root)"
-    echo "SHA256: OK"
-    echo "配置校验: OK"
-    echo "--------------------------------""$DEST" version
-
     echo
-    ok "安装完成！没有自动启动服务。"
-}
+    echo "========================================"
+    echo "       sing-box Alpine Installer"
+    echo "========================================"
+    echo
+
+    check_environment
+    install_dependencies
+    prepare_workspace
+    get_latest_release
+    download_package
+    extract_binary
+    prepare_config
+    install_binary
+    configure_openrc_service
+    final_check
+                                }
 
 main "$@"
