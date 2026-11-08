@@ -1,11 +1,10 @@
-#!/usr/bin/env bash
-# Alpine Linux 64MB sing-box Installer
-# Version: 5.0
+#!/bin/bash
+# sing-box Alpine 64MB Installer v5.1
 
 set -Eeuo pipefail
 umask 077
 
-VERSION_SCRIPT="5.0"
+VERSION_SCRIPT="5.1"
 REPO="SagerNet/sing-box"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
@@ -15,32 +14,24 @@ CONFIG_DIR="/etc/sing-box"
 CONFIG="${CONFIG_DIR}/config.json"
 SERVICE="/etc/init.d/sing-box"
 
-WORK_BASE="/var/tmp"
 WORK=""
-ARCHIVE=""
-RELEASE_JSON=""
 CANDIDATE=""
 NEW_BINARY=""
-SERVICE_TMP=""
 
-VERSION=""
-ARCH=""
-ASSET=""
-URL=""
-DIGEST=""
-ASSET_SIZE=""
-
-log()  { printf '[INFO] %s\n' "$*"; }
-ok()   { printf '[ OK ] %s\n' "$*"; }
-warn() { printf '[WARN] %s\n' "$*" >&2; }
-die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+log()  { echo "[INFO] $*"; }
+ok()   { echo "[ OK ] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+die()  { echo "[FAIL] $*" >&2; exit 1; }
 
 cleanup() {
-    local status=$?
-    [ -n "${WORK:-}" ] && rm -rf "$WORK"
-    [ -n "${NEW_BINARY:-}" ] && rm -f "$NEW_BINARY"
-    [ -n "${SERVICE_TMP:-}" ] && rm -f "$SERVICE_TMP"
-    exit "$status"
+    local rc=$?
+    if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+        rm -rf "$WORK"
+    fi
+    if [ -n "${NEW_BINARY:-}" ]; then
+        rm -f "$NEW_BINARY"
+    fi
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -48,87 +39,58 @@ check_environment() {
     log "检查运行环境..."
 
     [ "$(id -u)" = "0" ] || die "请使用 root 运行"
-    [ -f /etc/alpine-release ] || die "此脚本仅支持 Alpine Linux"
-    command -v apk >/dev/null 2>&1 || die "找不到 apk"
+    [ -f /etc/alpine-release ] || die "仅支持 Alpine Linux"
 
-    log "检查必要依赖..."
-
-    local missing=()
-    command -v curl >/dev/null 2>&1 || missing+=(curl)
-    command -v jq >/dev/null 2>&1 || missing+=(jq)
-
-    if [ "${#missing[@]}" -gt 0 ]; then
-        log "安装依赖: ${missing[*]}"
-        apk add --no-cache "${missing[@]}" || die "依赖安装失败"
-    fi
-
-    local cmd
-    for cmd in tar sha256sum awk grep df mktemp; do
-        command -v "$cmd" >/dev/null 2>&1 || die "缺少命令: $cmd"
+    for cmd in wget jq sha256sum tar awk grep wc df mktemp; do
+        command -v "$cmd" >/dev/null 2>&1 || die "缺少命令 $cmd，请先单独安装该依赖"
     done
 
-    ok "运行环境检查通过"
+    [ -d /sys/fs/cgroup ] || warn "未检测到 cgroup 目录"
+
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        log "内存限制: $(cat /sys/fs/cgroup/memory.max) bytes"
+    fi
+
+    if [ -r /sys/fs/cgroup/memory.current ]; then
+        log "当前内存使用: $(cat /sys/fs/cgroup/memory.current) bytes"
+    fi
+
+    ok "环境检查通过，不安装额外依赖"
 }
 
 detect_arch() {
-    log "检测 CPU 架构..."
-
     case "$(uname -m)" in
-        aarch64|arm64)
-            ARCH="arm64"
-            ;;
-        x86_64|amd64)
-            ARCH="amd64"
-            ;;
-        *)
-            die "不支持的 CPU 架构: $(uname -m)"
-            ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        x86_64|amd64) ARCH="amd64" ;;
+        *) die "不支持的 CPU 架构: $(uname -m)" ;;
     esac
 
     ok "CPU 架构: $ARCH"
 }
 
 prepare_workspace() {
-    log "准备临时目录..."
-
-    mkdir -p "$WORK_BASE"
-    WORK="$(mktemp -d "${WORK_BASE}/sing-box.XXXXXX")"
+    mkdir -p /var/tmp
+    WORK="$(mktemp -d /var/tmp/sing-box.XXXXXX)"
     chmod 700 "$WORK"
 
-    ARCHIVE="${WORK}/sing-box.tar.gz"
+    ARCHIVE="${WORK}/release.tar.gz"
     RELEASE_JSON="${WORK}/release.json"
+    CANDIDATE="${WORK}/sing-box"
 
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 
-    ok "临时目录准备完成"
+    [ ! -L "$CONFIG_DIR" ] || die "配置目录是符号链接，拒绝继续"
+    [ ! -L "$DEST" ] || die "正式二进制是符号链接，拒绝继续"
 }
 
-check_disk_space() {
-    local available_kb
-    available_kb="$(df -Pk "$WORK" | awk 'END {print $4}')"
+get_release() {
+    log "获取官方稳定版本..."
 
-    [[ "$available_kb" =~ ^[0-9]+$ ]] || die "无法读取剩余磁盘空间"
-
-    local required_kb=$((ASSET_SIZE * 3 / 1024 + 10240))
-
-    log "检查磁盘空间..."
-    log "可用空间: $((available_kb / 1024)) MB"
-    log "预计需要: $((required_kb / 1024)) MB"
-
-    [ "$available_kb" -ge "$required_kb" ] || die "磁盘空间不足"
-}
-
-fetch_release() {
-    log "获取 sing-box 最新稳定版本..."
-
-    curl -fLsS \
-        --connect-timeout 15 \
-        --max-time 120 \
-        --retry 3 \
-        --retry-delay 2 \
-        -H "Accept: application/vnd.github+json" \
-        -H "User-Agent: Alpine-sing-box-Installer" \
-        "$API" -o "$RELEASE_JSON" || die "获取 GitHub Release 失败"
+    wget -qO "$RELEASE_JSON" \
+        --timeout=30 \
+        --tries=3 \
+        --user-agent="Alpine-sing-box-Installer" \
+        "$API" || die "获取 GitHub Release 失败"
 
     VERSION="$(jq -er '
         select(.draft == false and .prerelease == false)
@@ -147,7 +109,7 @@ fetch_release() {
         ]
         | sort_by(if (.name | endswith("-musl.tar.gz")) then 0 else 1 end)
         | .[0].name
-    ' "$RELEASE_JSON")" || die "没有找到对应架构的官方安装包"
+    ' "$RELEASE_JSON")" || die "没有找到对应架构的安装包"
 
     URL="$(jq -er --arg name "$ASSET" '
         .assets[]
@@ -159,7 +121,7 @@ fetch_release() {
         .assets[]
         | select(.name == $name)
         | .digest
-    ' "$RELEASE_JSON")" || die "GitHub 没有提供官方 SHA256 摘要"
+    ' "$RELEASE_JSON")" || die "官方 Release 未提供 SHA256，停止安装"
 
     ASSET_SIZE="$(jq -er --arg name "$ASSET" '
         .assets[]
@@ -168,45 +130,48 @@ fetch_release() {
     ' "$RELEASE_JSON")" || die "无法读取安装包大小"
 
     case "$URL" in
-        https://github.com/SagerNet/sing-box/releases/download/*)
-            ;;
-        *)
-            die "下载地址不是官方 Release 地址"
-            ;;
+        https://github.com/SagerNet/sing-box/releases/download/*) ;;
+        *) die "下载地址不是官方 Release 地址" ;;
     esac
 
     DIGEST="${DIGEST#sha256:}"
 
-    [ "${#DIGEST}" -eq 64 ] || die "SHA256 长度不正确"
+    [ "${#DIGEST}" -eq 64 ] || die "SHA256 长度错误"
 
     case "$DIGEST" in
-        *[!0-9a-fA-F]*|'')
-            die "SHA256 格式不正确"
-            ;;
+        *[!0-9a-fA-F]*|'') die "SHA256 格式错误" ;;
     esac
 
-    [[ "$ASSET_SIZE" =~ ^[0-9]+$ ]] || die "安装包大小格式错误"
-    [ "$ASSET_SIZE" -gt 0 ] || die "安装包大小为零"
+    case "$ASSET_SIZE" in
+        ''|*[!0-9]*) die "安装包大小格式错误" ;;
+    esac
 
-    ok "最新稳定版本: $VERSION"
-    ok "目标架构: $ARCH"
+    ok "稳定版本: $VERSION"
     ok "安装包: $ASSET"
-    ok "已获取 SHA256 摘要"
+}
 
-    check_disk_space
+check_disk() {
+    local free_kb
+    free_kb="$(df -Pk /var/tmp | awk 'END {print $4}')"
+
+    case "$free_kb" in
+        ''|*[!0-9]*) die "无法检查磁盘空间" ;;
+    esac
+
+    local need_kb=$((ASSET_SIZE / 1024 * 3 + 8192))
+
+    log "临时目录可用空间: $((free_kb / 1024)) MB"
+
+    [ "$free_kb" -ge "$need_kb" ] || die "磁盘空间不足"
 }
 
 download_release() {
-    log "下载 sing-box 安装包..."
+    log "下载官方安装包..."
 
-    curl -fLsS \
-        --connect-timeout 20 \
-        --max-time 1800 \
-        --retry 3 \
-        --retry-delay 3 \
-        --retry-all-errors \
-        -H "User-Agent: Alpine-sing-box-Installer" \
-        "$URL" -o "$ARCHIVE" || die "下载失败"
+    wget -qO "$ARCHIVE" \
+        --timeout=60 \
+        --tries=3 \
+        "$URL" || die "下载失败"
 
     local actual_size
     actual_size="$(wc -c < "$ARCHIVE")"
@@ -216,7 +181,7 @@ download_release() {
     ok "下载完成"
 }
 
-verify_archive() {
+verify_sha256() {
     log "验证 SHA256..."
 
     local actual
@@ -228,65 +193,53 @@ verify_archive() {
 }
 
 extract_binary() {
-    log "检查并提取安装包..."
+    log "提取二进制文件..."
 
     local top_dir
-    local entry
-
     top_dir="${ASSET%.tar.gz}"
-    entry="${top_dir}/sing-box"
 
-    tar -tzf "$ARCHIVE" > "${WORK}/archive.list" || die "压缩包损坏"
+    tar -tzf "$ARCHIVE" > "${WORK}/files.txt" || die "压缩包损坏"
 
-    grep -Fxq "$entry" "${WORK}/archive.list" || die "安装包中找不到 sing-box"
+    grep -Fxq "${top_dir}/sing-box" "${WORK}/files.txt" \
+        || die "压缩包中找不到 sing-box"
 
-    CANDIDATE="${WORK}/sing-box"
-    tar -xOzf "$ARCHIVE" "$entry" > "$CANDIDATE" || die "提取二进制失败"
+    tar -xOzf "$ARCHIVE" "${top_dir}/sing-box" > "$CANDIDATE" \
+        || die "提取二进制失败"
 
-    [ -s "$CANDIDATE" ] || die "提取出的二进制为空"
+    [ -s "$CANDIDATE" ] || die "提取出的文件为空"
     chmod 755 "$CANDIDATE"
 
-    ok "二进制文件提取完成"
+    ok "二进制提取完成"
 }
 
 verify_binary() {
-    log "验证新二进制文件..."
+    log "验证新二进制..."
 
-    local version_output
+    local output
+    if ! output="$("$CANDIDATE" version 2>&1)"; then
+        warn "$output"
+        die "新二进制执行失败，拒绝安装"
+    fi
 
-    version_output="$("$CANDIDATE" version 2>&1)" || {
-        warn "$version_output"
-        die "新二进制无法运行，拒绝安装"
-    }
-
-    case "$version_output" in
-        *"$VERSION"*)
-            ;;
-        *)
-            die "二进制版本与 Release 版本不一致"
-            ;;
+    case "$output" in
+        *"$VERSION"*) ;;
+        *) die "二进制版本与 Release 版本不一致" ;;
     esac
 
-    ok "二进制运行正常"
-    log "$version_output"
+    ok "二进制执行正常"
+    echo "$output"
 }
 
 prepare_config() {
     log "检查配置文件..."
 
-    if [ -L "$CONFIG" ]; then
-        die "配置文件是符号链接，拒绝覆盖"
-    fi
+    [ ! -L "$CONFIG" ] || die "配置文件是符号链接，拒绝覆盖"
 
-    if [ -e "$CONFIG" ] && [ ! -f "$CONFIG" ]; then
-        die "配置路径不是普通文件"
-    fi
-
-    if [ ! -f "$CONFIG" ]; then
-        log "创建默认配置文件..."
+    if [ ! -e "$CONFIG" ]; then
+        log "创建默认配置..."
 
         local config_tmp
-        config_tmp="$(mktemp "${CONFIG_DIR}/.config.XXXXXX")"
+        config_tmp="${WORK}/config.json"
 
         cat > "$config_tmp" <<'JSON'
 {
@@ -304,30 +257,27 @@ prepare_config() {
 }
 JSON
 
-        chown root:root "$config_tmp"
-        chmod 600 "$config_tmp"
+        "$CANDIDATE" check -c "$config_tmp" \
+            || die "默认配置检查失败"
 
-        "$CANDIDATE" check -c "$config_tmp" || {
-            rm -f "$config_tmp"
-            die "默认配置检查失败"
-        }
-
-        mv -f "$config_tmp" "$CONFIG"
-        ok "默认配置文件创建成功"
+        install -o root -g root -m 600 "$config_tmp" "$CONFIG"
+        ok "默认配置创建成功"
     else
-        log "发现已有配置，保留原配置"
-        "$CANDIDATE" check -c "$CONFIG" || die "现有配置无法通过新版本检查"
+        [ -f "$CONFIG" ] || die "配置路径不是普通文件"
+
+        "$CANDIDATE" check -c "$CONFIG" \
+            || die "现有配置无法通过新版本检查"
+
+        ok "保留并验证现有配置"
     fi
 
     chown root:root "$CONFIG_DIR" "$CONFIG"
     chmod 755 "$CONFIG_DIR"
     chmod 600 "$CONFIG"
-
-    ok "配置文件检查通过"
 }
 
 install_binary() {
-    log "安装 sing-box 二进制文件..."
+    log "安装正式二进制..."
 
     NEW_BINARY="${INSTALL_DIR}/.sing-box.new.$$"
 
@@ -335,7 +285,7 @@ install_binary() {
     chown root:root "$NEW_BINARY"
     chmod 755 "$NEW_BINARY"
 
-    "$NEW_BINARY" version >/dev/null 2>&1 || die "安装前二次运行检查失败"
+  
 
     mv -f "$NEW_BINARY" "$DEST"
     NEW_BINARY=""
@@ -343,22 +293,18 @@ install_binary() {
     chown root:root "$DEST"
     chmod 755 "$DEST"
 
-    ok "sing-box 二进制安装完成"
+    ok "二进制安装完成"
 }
 
 create_service() {
     log "创建 OpenRC 服务..."
 
-    command -v rc-update >/dev/null 2>&1 || {
-        log "安装 OpenRC..."
-        apk add --no-cache openrc || die "OpenRC 安装失败"
-    }
-
     [ -x /sbin/openrc-run ] || die "找不到 /sbin/openrc-run"
 
-    SERVICE_TMP="/etc/init.d/.sing-box.$$"
+    local service_tmp
+    service_tmp="${WORK}/sing-box.init"
 
-    cat > "$SERVICE_TMP" <<'EOF'
+    cat > "$service_tmp" <<'EOF'
 #!/sbin/openrc-run
 
 name="sing-box"
@@ -385,29 +331,27 @@ start_pre() {
 }
 EOF
 
-    chown root:root "$SERVICE_TMP"
-    chmod 755 "$SERVICE_TMP"
-    mv -f "$SERVICE_TMP" "$SERVICE"
-    SERVICE_TMP=""
+    install -o root -g root -m 755 "$service_tmp" "$SERVICE"
 
-    ok "OpenRC 服务文件创建完成"
+    rc-update add sing-box default \
+        || die "设置开机启动失败"
 
-    rc-update add sing-box default || die "设置开机启动失败"
-
+    ok "OpenRC 服务创建完成"
     ok "已设置 default 开机启动"
 }
 
 main() {
     echo "========================================"
-    echo "     sing-box Alpine Installer v${VERSION_SCRIPT}"
+    echo " sing-box Alpine Installer v${VERSION_SCRIPT}"
     echo "========================================"
 
     check_environment
     detect_arch
     prepare_workspace
-    fetch_release
+    get_release
+    check_disk
     download_release
-    verify_archive
+    verify_sha256
     extract_binary
     verify_binary
     prepare_config
@@ -416,17 +360,16 @@ main() {
 
     echo "========================================"
     echo "安装完成"
-    echo "sing-box 版本: ${VERSION}"
-    echo "CPU 架构: ${ARCH}"
+    echo "版本: ${VERSION}"
+    echo "架构: ${ARCH}"
     echo "二进制: ${DEST}"
-    echo "配置文件: ${CONFIG}"
-    echo "服务文件: ${SERVICE}"
-    echo "配置权限: 600"
+    echo "配置: ${CONFIG}"
+    echo "服务: ${SERVICE}"
     echo "开机启动: 已设置"
     echo "自动启动: 未执行"
     echo "========================================"
 
-    ok "安装成功，没有启动 sing-box"
+    ok "安装成功"
 }
 
 main "$@"
