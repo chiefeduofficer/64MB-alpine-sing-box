@@ -583,6 +583,60 @@ install_binary() {
 
     
 mv -f "$NEW""$DEST"
+# ==========================================
+# 自动初始化 sing-box 配置
+# ==========================================
+
+CONFIG_DIR="/etc/sing-box"
+CONFIG="$CONFIG_DIR/config.json"
+
+mkdir -p "$CONFIG_DIR"
+chown root:root "$CONFIG_DIR"
+chmod 755 "$CONFIG_DIR"
+
+if [ ! -f "$CONFIG"
+]; then
+    CONFIG_TMP="$(mktemp "$CONFIG_DIR/.config.json.XXXXXX")"
+
+    cat > "$CONFIG_TMP" <<'EOF'
+{
+"log": {
+  "level": "info",
+  "timestamp": true
+},
+"inbounds": [],
+"outbounds": [
+  {
+    "type": "direct",
+    "tag": "direct"
+  }
+],
+"route": {
+  "final": "direct"
+}
+}
+EOF
+
+    if ! "$DEST" check -c "$CONFIG_TMP"; then
+        rm -f "$CONFIG_TMP"
+        err "默认配置校验失败"
+        exit 1
+    fi
+
+    chown root:root "$CONFIG_TMP"
+    chmod 600 "$CONFIG_TMP"
+    mv -f "$CONFIG_TMP""$CONFIG"
+fi
+
+chown root:root "$CONFIG"
+chmod 600 "$CONFIG"
+
+if ! "$DEST" check -c "$CONFIG"; then
+    err "配置文件校验失败"
+    exit 1
+fi
+
+ok "配置文件初始化成功"
 
 ok "sing-box 二进制安装成功"
 
