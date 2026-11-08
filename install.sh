@@ -1,188 +1,178 @@
 
 #!/bin/sh
-#
-# Alpine Linux 64MB RAM sing-box installer
-# Low memory / BusyBox wget compatible
-# Official GitHub Release
-#
+# Alpine 64MB sing-box V3
+# Single binary installer
+# No gzip / tar / curl / jq / bash on VPS
 
 set -eu
+umask 077
 
-REPO="SagerNet/sing-box"
-INSTALL_DIR="/usr/local/bin"
-INSTALL_BIN="$INSTALL_DIR/sing-box"
+# 修改为你自己的 GitHub 仓库
+REPO="${SB_REPO:-YOUR_GITHUB_USERNAME/alpine-sing-box}"
+DEST="/usr/local/bin/sing-box"
+BACKUP="${DEST}.bak"
 
-echo "========================================"
-echo " Alpine 64MB sing-box installer"
-echo "========================================"
-
-# 1. Root check
-if [ "$(id -u)" != "0" ]; then
-    echo "[ERROR] Please run as root"
+info() { echo "[INFO] $*"; }
+ok()   { echo "[OK] $*"; }
+fail() {
+    echo "[ERROR] $*" >&2
     exit 1
-fi
+}
 
-# 2. Check required commands
-for cmd in wget tar uname awk sed grep mkdir rm chmod mv df; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "[ERROR] Missing command: $cmd"
-        exit 1
-    fi
-done
+# Root
+[ "$(id -u)" = "0" ] || fail "请使用 root 运行"
 
-# 3. Detect CPU architecture
-case "$(uname -m)" in
-    x86_64|amd64)
-        ARCH="amd64"
-        ;;
-    aarch64|arm64)
-        ARCH="arm64"
-        ;;
-    armv7l|armv7)
-        ARCH="armv7"
-        ;;
-    i386|i486|i586|i686)
-        ARCH="386"
-        ;;
-    *)
-        echo "[ERROR] Unsupported architecture: $(uname -m)"
-        exit 1
+# Alpine
+[ -f /etc/alpine-release ] || fail "仅支持 Alpine Linux"
+
+# Version argument
+VERSION="${1:-}"
+
+[ -n "$VERSION" ] || {
+    echo "用法: $0 <version>"
+    echo "示例: $0 1.14.4"
+    exit 1
+}
+
+VERSION="${VERSION#v}"
+
+case "$VERSION" in
+    *[!0-9.]*|.*|*.)
+        fail "版本格式错误: $VERSION"
         ;;
 esac
 
-echo "[INFO] Architecture: $ARCH"
+case "$VERSION" in
+    *..*)
+        fail "版本格式错误: $VERSION"
+        ;;
+esac
 
-# 4. Select writable working directory
-WORK=""
+# Architecture
+case "$(uname -m)" in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    armv7l) ARCH="armv7" ;;
+    *)
+        fail "暂不支持架构: $(uname -m)"
+        ;;
+esac
 
-for d in /root /var/cache /var/tmp /tmp; do
-    if [ -d "$d" ] && [ -w "$d" ]; then
-        WORK="$d"
-        break
-    fi
-done
+# BusyBox wget
+command -v wget >/dev/null 2>&1 || fail "缺少 wget"
 
-if [ -z "$WORK" ]; then
-    echo "[ERROR] No writable working directory"
-    exit 1
+# SHA256
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA_CMD="sha256sum"
+elif busybox sha256sum --help >/dev/null 2>&1; then
+    SHA_CMD="busybox sha256sum"
+else
+    fail "缺少 SHA256 工具"
 fi
 
-# 5. Temporary files
-PREFIX="$WORK/singbox-install-$$"
-JSON="$PREFIX.json"
-PKG="$PREFIX.tar.gz"
-EXTRACT="$PREFIX"
-BIN_TMP="$INSTALL_BIN.tmp.$$"
+# URLs
+TAG="sing-box-v${VERSION}"
+ASSET="sing-box-linux-${ARCH}"
+
+BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+BIN_URL="${BASE}/${ASSET}"
+SUM_URL="${BASE}/${ASSET}.sha256"
+
+# Temp files in destination directory:
+# same filesystem makes final rename atomic.
+mkdir -p "$(dirname "$DEST")"
+
+TMP_BIN="${DEST}.download.$$"
+TMP_SUM="${DEST}.sha256.$$"
+TMP_BACKUP="${BACKUP}.tmp.$$"
 
 cleanup() {
-    rm -f "$JSON" "$PKG" "$BIN_TMP"
-    rm -rf "$EXTRACT"
+    rm -f "$TMP_BIN" "$TMP_SUM" "$TMP_BACKUP"
+}
+trap cleanup EXIT HUP INT TERM
+
+info "Alpine: $(cat /etc/alpine-release)"
+info "版本: $VERSION"
+info "架构: $ARCH"
+info "来源: $REPO"
+
+# Download binary
+info "下载 sing-box 单文件..."
+
+wget -q -T 20 -t 3 \
+    -O "$TMP_BIN" "$BIN_URL" || {
+        fail "二进制下载失败"
+    }
+
+[ -s "$TMP_BIN" ] || fail "下载文件为空"
+
+# Download checksum
+info "下载 SHA256..."
+
+wget -q -T 20 -t 3 \
+    -O "$TMP_SUM" "$SUM_URL" || {
+        fail "SHA256 下载失败"
+    }
+
+[ -s "$TMP_SUM" ] || fail "SHA256 文件为空"
+
+EXPECTED="$(awk 'NR==1 {print $1}' "$TMP_SUM")"
+
+# Check SHA256 format
+case "$EXPECTED" in
+    *[!0123456789abcdefABCDEF]*|'')
+        fail "SHA256 格式错误"
+        ;;
+esac
+
+[ "${#EXPECTED}" -eq 64 ] || fail "SHA256 长度错误"
+
+# Calculate SHA256
+info "正在校验文件..."
+
+ACTUAL="$($SHA_CMD "$TMP_BIN" | awk '{print $1}')"
+
+[ "$ACTUAL" = "$EXPECTED" ] || {
+    fail "SHA256 校验失败，拒绝安装"
 }
 
-trap cleanup EXIT
-trap 'exit 1' INT TERM HUP
+ok "SHA256 校验通过"
 
-echo "[INFO] Working directory: $WORK"
+# Preserve previous version
+if [ -e "$DEST" ]; then
+    info "备份当前版本..."
 
-# 6. Get latest stable release
-echo "[INFO] Checking latest stable release..."
-
-API="https://api.github.com/repos/$REPO/releases/latest"
-
-wget -q -O "$JSON" "$API" || {
-    echo "[ERROR] Cannot access GitHub API"
-    exit 1
-}
-
-VERSION=$(sed -n \
-    's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' \
-    "$JSON" | sed -n '1p')
-
-if [ -z "$VERSION" ]; then
-    echo "[ERROR] Cannot detect release version"
-    exit 1
-fi
-
-echo "[INFO] Latest stable version: $VERSION"
-
-# 7. Download official binary archive
-URL="https://github.com/$REPO/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${ARCH}.tar.gz"
-
-echo "[INFO] Downloading sing-box..."
-echo "[INFO] Download target: $URL"
-
-# BusyBox wget compatible
-wget -q -O "$PKG" "$URL" || {
-    echo "[ERROR] Download failed"
-    exit 1
-}
-
-if [ ! -s "$PKG" ]; then
-    echo "[ERROR] Downloaded archive is empty"
-    exit 1
-fi
-
-echo "[INFO] Download completed"
-
-# 8. Check archive integrity
-echo "[INFO] Checking archive..."
-
-tar -tzf "$PKG" >/dev/null 2>&1 || {
-    echo "[ERROR] Invalid or corrupted archive"
-    exit 1
-}
-
-# 9. Extract on disk, not RAM
-echo "[INFO] Extracting archive..."
-
-mkdir "$EXTRACT"
-
-tar -xzf "$PKG" -C "$EXTRACT" || {
-    echo "[ERROR] Extraction failed"
-    exit 1
-}
-
-# 10. Locate binary
-BIN=""
-
-for d in "$EXTRACT"/*; do
-    if [ -f "$d/sing-box" ]; then
-        BIN="$d/sing-box"
-        break
+    # Prefer hard link to avoid copying the old binary.
+    if ! ln "$DEST" "$TMP_BACKUP" 2>/dev/null; then
+        cp -p "$DEST" "$TMP_BACKUP" || fail "旧版本备份失败"
     fi
-done
 
-if [ -z "$BIN" ]; then
-    echo "[ERROR] sing-box binary not found"
-    exit 1
+    mv -f "$TMP_BACKUP" "$BACKUP" || {
+        fail "旧版本备份提交失败"
+    }
+
+    ok "旧版本已备份: $BACKUP"
 fi
 
-# 11. Install binary
-echo "[INFO] Installing sing-box..."
+# Atomic replace
+chmod 755 "$TMP_BIN"
 
-mkdir -p "$INSTALL_DIR"
-
-cp "$BIN" "$BIN_TMP"
-chmod 755 "$BIN_TMP"
-mv -f "$BIN_TMP" "$INSTALL_BIN"
-
-# 12. Verify installation
-echo
-echo "========================================"
-echo " Installation completed successfully"
-echo "========================================"
-
-echo "[INFO] Installed binary:"
-echo "$INSTALL_BIN"
-
-echo
-echo "[INFO] sing-box version:"
-
-"$INSTALL_BIN" version || {
-    echo "[ERROR] Binary cannot execute"
-    exit 1
+mv -f "$TMP_BIN" "$DEST" || {
+    fail "安装失败，旧版本备份仍然保留"
 }
 
-echo
-echo "[INFO] Installation finished."
-echo "========================================"
+ok "sing-box 安装成功"
+
+echo "--------------------------------"
+echo "版本: $VERSION"
+echo "架构: $ARCH"
+echo "路径: $DEST"
+echo "SHA256: $ACTUAL"
+
+if [ -f "$BACKUP" ]; then
+    echo "备份: $BACKUP"
+fi
+
+echo "--------------------------------"
+echo "注意: 本脚本没有启动 sing-box"
