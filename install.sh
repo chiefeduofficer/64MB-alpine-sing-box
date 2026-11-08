@@ -1,178 +1,236 @@
 
-#!/bin/sh
-# Alpine 64MB sing-box V3
-# Single binary installer
-# No gzip / tar / curl / jq / bash on VPS
+#!/bin/bash
+# Alpine 64MB NAT sing-box Lite Installer
+# Version: 2.0
+# Official GitHub Release + SHA256 verification
+# Stream download + extract only sing-box binary
 
-set -eu
+set -Eeuo pipefail
 umask 077
 
-# 修改为你自己的 GitHub 仓库
-REPO="${SB_REPO:-YOUR_GITHUB_USERNAME/alpine-sing-box}"
+REPO="SagerNet/sing-box"
 DEST="/usr/local/bin/sing-box"
-BACKUP="${DEST}.bak"
+WORK="/root/.singbox-install"
+API="https://api.github.com/repos/${REPO}/releases/latest"
 
 info() { echo "[INFO] $*"; }
-ok()   { echo "[OK] $*"; }
-fail() {
-    echo "[ERROR] $*" >&2
+ok()   { echo "[OK]   $*"; }
+err()  { echo "[ERROR] $*" >&2; }
+
+# Root check
+if [ "$(id -u)" -ne 0 ]; then
+    err "请使用 root 运行"
     exit 1
-}
-
-# Root
-[ "$(id -u)" = "0" ] || fail "请使用 root 运行"
-
-# Alpine
-[ -f /etc/alpine-release ] || fail "仅支持 Alpine Linux"
-
-# Version argument
-VERSION="${1:-}"
-
-[ -n "$VERSION" ] || {
-    echo "用法: $0 <version>"
-    echo "示例: $0 1.14.4"
-    exit 1
-}
-
-VERSION="${VERSION#v}"
-
-case "$VERSION" in
-    *[!0-9.]*|.*|*.)
-        fail "版本格式错误: $VERSION"
-        ;;
-esac
-
-case "$VERSION" in
-    *..*)
-        fail "版本格式错误: $VERSION"
-        ;;
-esac
-
-# Architecture
-case "$(uname -m)" in
-    x86_64|amd64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    armv7l) ARCH="armv7" ;;
-    *)
-        fail "暂不支持架构: $(uname -m)"
-        ;;
-esac
-
-# BusyBox wget
-command -v wget >/dev/null 2>&1 || fail "缺少 wget"
-
-# SHA256
-if command -v sha256sum >/dev/null 2>&1; then
-    SHA_CMD="sha256sum"
-elif busybox sha256sum --help >/dev/null 2>&1; then
-    SHA_CMD="busybox sha256sum"
-else
-    fail "缺少 SHA256 工具"
 fi
 
-# URLs
-TAG="sing-box-v${VERSION}"
-ASSET="sing-box-linux-${ARCH}"
+# Check Alpine
+if [ ! -f /etc/alpine-release ]; then
+    err "此脚本专门针对 Alpine Linux"
+    exit 1
+fi
 
-BASE="https://github.com/${REPO}/releases/download/${TAG}"
+# Check dependencies
+for cmd in bash curl jq tar tee sha256sum awk uname mktemp; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "缺少依赖: $cmd"
+        err "请执行: apk add --no-cache bash curl jq tar coreutils"
+        exit 1
+    fi
+done
 
-BIN_URL="${BASE}/${ASSET}"
-SUM_URL="${BASE}/${ASSET}.sha256"
-
-# Temp files in destination directory:
-# same filesystem makes final rename atomic.
-mkdir -p "$(dirname "$DEST")"
-
-TMP_BIN="${DEST}.download.$$"
-TMP_SUM="${DEST}.sha256.$$"
-TMP_BACKUP="${BACKUP}.tmp.$$"
-
-cleanup() {
-    rm -f "$TMP_BIN" "$TMP_SUM" "$TMP_BACKUP"
-}
-trap cleanup EXIT HUP INT TERM
-
-info "Alpine: $(cat /etc/alpine-release)"
-info "版本: $VERSION"
-info "架构: $ARCH"
-info "来源: $REPO"
-
-# Download binary
-info "下载 sing-box 单文件..."
-
-wget -q -T 20 -t 3 \
-    -O "$TMP_BIN" "$BIN_URL" || {
-        fail "二进制下载失败"
-    }
-
-[ -s "$TMP_BIN" ] || fail "下载文件为空"
-
-# Download checksum
-info "下载 SHA256..."
-
-wget -q -T 20 -t 3 \
-    -O "$TMP_SUM" "$SUM_URL" || {
-        fail "SHA256 下载失败"
-    }
-
-[ -s "$TMP_SUM" ] || fail "SHA256 文件为空"
-
-EXPECTED="$(awk 'NR==1 {print $1}' "$TMP_SUM")"
-
-# Check SHA256 format
-case "$EXPECTED" in
-    *[!0123456789abcdefABCDEF]*|'')
-        fail "SHA256 格式错误"
+# Detect architecture
+case "$(uname -m)" in
+    x86_64|amd64)
+        ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        ARCH="arm64"
+        ;;
+    armv7l)
+        ARCH="armv7"
+        ;;
+    *)
+        err "不支持的 CPU 架构: $(uname -m)"
+        exit 1
         ;;
 esac
 
-[ "${#EXPECTED}" -eq 64 ] || fail "SHA256 长度错误"
+# Alpine uses musl
+LIBC="-musl"
 
-# Calculate SHA256
-info "正在校验文件..."
+info "系统: Alpine Linux"
+info "架构: ${ARCH}"
+info "C 库: musl"
 
-ACTUAL="$($SHA_CMD "$TMP_BIN" | awk '{print $1}')"
+# Use disk-backed directory, never /tmp
+mkdir -p "$WORK"
+chmod 700 "$WORK"
 
-[ "$ACTUAL" = "$EXPECTED" ] || {
-    fail "SHA256 校验失败，拒绝安装"
+# Clean stale installer files
+find "$WORK" -maxdepth 1 -type f \
+    -name 'sb-install.*' -delete 2>/dev/null || true
+
+TMP="$(mktemp -d "$WORK/sb-install.XXXXXX")"
+OUT="$TMP/sing-box"
+DIGEST="$TMP/archive.sha256"
+META="$TMP/release.json"
+
+cleanup() {
+    rm -rf "$TMP"
 }
+trap cleanup EXIT
+
+# Fetch release metadata
+info "获取 GitHub 最新稳定版..."
+
+curl -fsSL \
+    --connect-timeout 15 \
+    --max-time 60 \
+    "$API" -o "$META" || {
+        err "无法获取 GitHub Release 信息"
+        exit 1
+    }
+
+# Parse and validate release metadata
+RELEASE="$(jq -er '
+    select(.draft == false and .prerelease == false)
+    | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    | .tag_name
+' "$META")" || {
+    err "无法识别稳定版版本号"
+    exit 1
+}
+
+VERSION="${RELEASE#v}"
+
+# Find exact musl asset
+ASSET="sing-box-${VERSION}-linux-${ARCH}${LIBC}.tar.gz"
+
+ASSET_INFO="$(jq -er --arg name "$ASSET" '
+    [.assets[] | select(.name == $name)] as $a
+    | select(($a | length) == 1)
+    | [
+        $a[0].browser_download_url,
+        $a[0].digest
+      ]
+    | @tsv
+' "$META")" || {
+    err "没有找到对应架构的官方 musl 安装包: $ASSET"
+    exit 1
+}
+
+IFS=$'\t' read -r URL EXPECTED_DIGEST <<< "$ASSET_INFO"
+
+# Validate download URL and digest
+EXPECTED_URL="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
+
+if [ "$URL" != "$EXPECTED_URL" ]; then
+    err "下载地址校验失败"
+    exit 1
+fi
+
+if [[ ! "$EXPECTED_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]]; then
+    err "官方 SHA256 摘要无效，拒绝安装"
+    exit 1
+fi
+
+EXPECTED_DIGEST="${EXPECTED_DIGEST#sha256:}"
+
+info "版本: ${VERSION}"
+info "安装包: ${ASSET}"
+info "开始流式下载与解压..."
+
+# Extract only the main executable.
+# tee sends the same compressed stream to SHA256 and tar.
+ENTRY="sing-box-${VERSION}-linux-${ARCH}${LIBC}/sing-box"
+
+set +e
+curl -fLsS \
+    --retry 2 \
+    --connect-timeout 15 \
+    --max-time 900 \
+    "$URL" |
+    tee >(sha256sum > "$DIGEST") |
+    tar -xzOf - "$ENTRY" > "$OUT"
+
+STATUS=("${PIPESTATUS[@]}")
+set -e
+
+if [ "${STATUS[0]}" -ne 0 ] || \
+   [ "${STATUS[1]}" -ne 0 ] || \
+   [ "${STATUS[2]}" -ne 0 ]; then
+    err "下载或流式解压失败"
+    exit 1
+fi
+
+# Wait for digest process to finish
+WAIT=0
+while [ ! -s "$DIGEST" ] && [ "$WAIT" -lt 100 ]; do
+    sleep 0.1
+    WAIT=$((WAIT + 1))
+done
+
+if [ ! -s "$DIGEST" ]; then
+    err "SHA256 计算失败"
+    exit 1
+fi
+
+ACTUAL_DIGEST="$(awk '{print $1}' "$DIGEST")"
+
+if [ "${ACTUAL_DIGEST,,}" != "${EXPECTED_DIGEST,,}" ]; then
+    err "SHA256 校验失败，拒绝安装"
+    exit 1
+fi
 
 ok "SHA256 校验通过"
 
-# Preserve previous version
-if [ -e "$DEST" ]; then
-    info "备份当前版本..."
-
-    # Prefer hard link to avoid copying the old binary.
-    if ! ln "$DEST" "$TMP_BACKUP" 2>/dev/null; then
-        cp -p "$DEST" "$TMP_BACKUP" || fail "旧版本备份失败"
-    fi
-
-    mv -f "$TMP_BACKUP" "$BACKUP" || {
-        fail "旧版本备份提交失败"
-    }
-
-    ok "旧版本已备份: $BACKUP"
+# Verify extracted binary
+if [ ! -s "$OUT" ]; then
+    err "提取的 sing-box 文件为空"
+    exit 1
 fi
 
-# Atomic replace
-chmod 755 "$TMP_BIN"
+chmod 755 "$OUT"
 
-mv -f "$TMP_BIN" "$DEST" || {
-    fail "安装失败，旧版本备份仍然保留"
-}
+if ! "$OUT" version >/dev/null 2>&1; then
+    err "sing-box 二进制无法运行"
+    exit 1
+fi
+
+ACTUAL_VERSION="$("$OUT" version 2>/dev/null |
+    sed -n 's/^sing-box version \([^ ]*\).*/\1/p' |
+    head -n 1)"
+
+if [ "$ACTUAL_VERSION" != "$VERSION" ]; then
+    err "版本校验不一致"
+    exit 1
+fi
+
+# Atomic installation
+mkdir -p "$(dirname "$DEST")"
+
+NEW="${DEST}.new.$$"
+
+cp "$OUT" "$NEW"
+chmod 755 "$NEW"
+
+if ! "$NEW" version >/dev/null 2>&1; then
+    rm -f "$NEW"
+    err "安装前二次验证失败"
+    exit 1
+fi
+
+mv -f "$NEW" "$DEST"
 
 ok "sing-box 安装成功"
-
 echo "--------------------------------"
 echo "版本: $VERSION"
 echo "架构: $ARCH"
 echo "路径: $DEST"
-echo "SHA256: $ACTUAL"
-
-if [ -f "$BACKUP" ]; then
-    echo "备份: $BACKUP"
-fi
-
+echo "校验: SHA256 OK"
 echo "--------------------------------"
-echo "注意: 本脚本没有启动 sing-box"
+
+"$DEST" version
+
+echo
+ok "安装完成！没有自动启动服务。"
