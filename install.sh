@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Alpine 64MB sing-box Lite Installer
-# Version: 3.4
-# Stream download + SHA256 + BusyBox tar
+# Version: 3.4.1
+# Streaming download + SHA256 + BusyBox tar
+# Fixed: find_binary stdout pollution
+# Fixed: SHA256 process error handling
 
 set -Eeuo pipefail
 umask 077
 
-VERSION_SCRIPT="3.4"
+VERSION_SCRIPT="3.4.1"
 REPO="SagerNet/sing-box"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
@@ -17,9 +19,6 @@ CONFIG="${CONFIG_DIR}/config.json"
 WORK="/root/.singbox-install"
 LOCK_DIR="/run/sing-box-installer.lock"
 LOG="/var/log/sing-box-installer.log"
-
-CONNECT_TIMEOUT=15
-DOWNLOAD_TIMEOUT=1800
 
 TMP=""
 META=""
@@ -48,6 +47,7 @@ SERVICE_CREATED=0
 
 log() {
     local message="$*"
+
     printf '%s\n' "$message"
     printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
 }
@@ -61,11 +61,15 @@ ok() {
 }
 
 warn() {
-    log "[WARN] $*" >&2
+    local message="[WARN] $*"
+    printf '%s\n' "$message" >&2
+    printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
 }
 
 err() {
-    log "[ERROR] $*" >&2
+    local message="[ERROR] $*"
+    printf '%s\n' "$message" >&2
+    printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
 }
 
 die() {
@@ -120,6 +124,7 @@ on_exit() {
         fi
 
     else
+
         [ -n "$BACKUP" ] && rm -f "$BACKUP"
         [ -n "$NEW" ] && rm -f "$NEW"
         [ -n "$CONFIG_TMP" ] && rm -f "$CONFIG_TMP"
@@ -147,7 +152,8 @@ trap 'exit 143' TERM
 bootstrap() {
     info "检查系统环境..."
 
-    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"
+    [ "$(id -u)" -eq 0 ] || \
+        die "请使用 root 运行"
 
     [ -f /etc/alpine-release ] || \
         die "此脚本仅支持 Alpine Linux"
@@ -158,10 +164,10 @@ bootstrap() {
     command -v bash >/dev/null 2>&1 || \
         die "没有找到 Bash"
 
-    # 只安装真正缺失的依赖
     if ! command -v jq >/dev/null 2>&1; then
         info "安装 jq..."
-        apk add --no-cache jq || die "jq 安装失败"
+        apk add --no-cache jq || \
+            die "jq 安装失败"
     fi
 
     if ! command -v sha256sum >/dev/null 2>&1; then
@@ -170,7 +176,10 @@ bootstrap() {
             die "coreutils 安装失败"
     fi
 
-    for cmd in wget tar tee jq sha256sum awk sed find df mktemp; do
+    for cmd in \
+        wget tar tee jq sha256sum awk sed \
+        find df mktemp tr grep
+    do
         command -v "$cmd" >/dev/null 2>&1 || \
             die "缺少必要命令：$cmd"
     done
@@ -227,6 +236,7 @@ acquire_lock() {
 
 detect_arch() {
     local machine
+
     machine="$(uname -m)"
 
     case "$machine" in
@@ -260,7 +270,6 @@ prepare_workspace() {
     mkdir -p "$WORK"
     chmod 700 "$WORK"
 
-    # 清理之前被 OOM 杀死留下的目录
     local stale_dir
     local stale_pid
 
@@ -314,7 +323,6 @@ check_disk_space() {
 
     info "磁盘剩余空间：$((available_kb / 1024)) MB"
 
-    # 解压后的二进制远大于压缩包
     [ "$available_kb" -ge 131072 ] || \
         die "磁盘剩余空间不足，至少建议 128MB"
 }
@@ -371,6 +379,7 @@ fetch_release() {
     )" || die "无法读取安装包大小"
 
     local expected_url
+
     expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
 
     [ "$URL" = "$expected_url" ] || \
@@ -405,16 +414,14 @@ stream_download_extract() {
 
     rm -f "$DIGEST_FILE"
 
-    # 创建 SHA256 子进程
     # FD 3 接收 tee 输出的数据
     exec 3> >(sha256sum > "$DIGEST_FILE")
 
     local hash_pid=$!
+    local hash_status=0
 
     local -a pipeline_status
-    local hash_status
 
-    # 这里不使用 set -e，手动检查每个管道状态
     set +e
 
     wget -qO- "$URL" \
@@ -428,32 +435,34 @@ stream_download_extract() {
     # 关闭 FD，让 SHA256 进程收到 EOF
     exec 3>&-
 
-    wait "$hash_pid"
-    hash_status=$?
+    # 显式等待并检查 SHA256 子进程
+    if wait "$hash_pid"; then
+        hash_status=0
+    else
+        hash_status=$?
+    fi
 
     if [ "${pipeline_status[0]:-1}" -ne 0 ]; then
-        die "wget 下载失败"
+        die "wget 下载失败，退出码：${pipeline_status[0]}"
     fi
 
     if [ "${pipeline_status[1]:-1}" -ne 0 ]; then
-        die "tee 数据转发失败"
+        die "tee 数据转发失败，退出码：${pipeline_status[1]}"
     fi
 
     if [ "${pipeline_status[2]:-1}" -ne 0 ]; then
-        die "tar 解压失败"
+        die "tar 解压失败，退出码：${pipeline_status[2]}"
     fi
 
     [ "$hash_status" -eq 0 ] || \
-        die "SHA256 计算进程失败"
+        die "SHA256 计算进程失败，退出码：$hash_status"
 
     [ -s "$DIGEST_FILE" ] || \
         die "SHA256 结果文件为空"
 
     local actual_digest
 
-    actual_digest="$(
-        awk '{print $1}' "$DIGEST_FILE"
-    )"
+    actual_digest="$(awk '{print $1}' "$DIGEST_FILE")"
 
     actual_digest="$(printf '%s' "$actual_digest" | tr 'A-F' 'a-f')"
 
@@ -473,24 +482,38 @@ stream_download_extract() {
 # --------------------------------------------------
 
 find_binary() {
-    info "查找 sing-box 二进制..."
-
     local extracted
 
+    # 重要：日志输出到 stderr
+    # stdout 只允许返回二进制文件路径
+
+    info "查找 sing-box 二进制..." >&2
+
     extracted="$(
-        find "$TMP" -type f -name sing-box | sed -n '1p'
+        find "$TMP" \
+            -type f \
+            -name sing-box \
+            -print -quit
     )"
 
-    [ -n "$extracted" ] || \
-        die "解压后没有找到 sing-box 文件"
+    [ -n "$extracted" ] || {
+        err "解压后没有找到 sing-box 文件"
+        return 1
+    }
 
-    [ -f "$extracted" ] || \
-        die "sing-box 文件不存在"
+    [ -f "$extracted" ] || {
+        err "sing-box 文件不存在"
+        return 1
+    }
 
-    chmod 755 "$extracted"
+    chmod 755 "$extracted" || {
+        err "无法设置 sing-box 执行权限"
+        return 1
+    }
 
-    ok "找到 sing-box 二进制"
+    ok "找到 sing-box 二进制" >&2
 
+    # stdout 只返回路径
     printf '%s\n' "$extracted"
 }
 
@@ -506,7 +529,8 @@ stage_binary() {
     mv "$extracted" "$NEW" || \
         die "无法移动新二进制文件"
 
-    chmod 755 "$NEW"
+    chmod 755 "$NEW" || \
+        die "无法设置新二进制执行权限"
 
     info "检查二进制能否运行..."
 
@@ -586,7 +610,8 @@ install_binary() {
     mv "$NEW" "$DEST" || \
         die "无法安装新版本"
 
-    chmod 755 "$DEST"
+    chmod 755 "$DEST" || \
+        die "无法设置正式二进制执行权限"
 
     ok "sing-box 二进制安装完成"
 }
@@ -669,7 +694,9 @@ main() {
 
     local extracted
 
-    extracted="$(find_binary)"
+    # 修复点：函数日志走 stderr，变量只接收文件路径
+    extracted="$(find_binary)" || \
+        die "查找 sing-box 二进制失败"
 
     stage_binary "$extracted"
     prepare_config
