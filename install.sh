@@ -27,11 +27,20 @@ DISK_RESERVE=$((1024 * 1024))
 # ============================================================
 # Logging
 # ============================================================
-info() { printf '[INFO] %s\n' "$*"; }
-ok()   { printf '[OK]   %s\n' "$*"; }
-warn() { printf '[WARN] %s\n' "$*" >&2; }
-err()  { printf '[ERROR] %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
+info() { printf '[INFO
+  ] %s\n' "$*";
+}
+ok()   { printf '[OK
+  ]   %s\n' "$*";
+}
+warn() { printf '[WARN
+  ] %s\n' "$*" >&2;
+}
+err()  { printf '[ERROR
+  ] %s\n' "$*" >&2;
+}
+die()  { err "$*"; exit 1;
+}
 
 # ============================================================
 # Global state
@@ -68,11 +77,16 @@ on_exit() {
     trap - EXIT INT TERM
     set +e
 
-    if [ "$ROLLBACK_ACTIVE" -eq 1 ]; then
+    if [
+    "$ROLLBACK_ACTIVE" -eq 1
+  ]; then
         warn "安装未完整成功，正在回滚 sing-box 二进制..."
 
-        if [ "$HAD_OLD" -eq 1 ] && [ -f "$BACKUP" ]; then
-            mv -f "$BACKUP" "$DEST"
+        if [
+    "$HAD_OLD" -eq 1
+  ] && [ -f "$BACKUP"
+  ]; then
+            mv -f "$BACKUP""$DEST"
             ok "已恢复旧版本"
         else
             rm -f "$DEST"
@@ -80,12 +94,15 @@ on_exit() {
         fi
     fi
 
-    [ -n "$NEW" ] && rm -f "$NEW"
-    [ -n "$BACKUP" ] && rm -f "$BACKUP"
-    [ -n "$CONFIG_TMP" ] && rm -f "$CONFIG_TMP"
-    [ -n "$TMP" ] && rm -rf "$TMP"
+    [ -n "$NEW"
+  ] && rm -f "$NEW"[ -n "$BACKUP"
+  ] && rm -f "$BACKUP"[ -n "$CONFIG_TMP"
+  ] && rm -f "$CONFIG_TMP"[ -n "$TMP"
+  ] && rm -rf "$TMP"
 
-    if [ "$LOCKED" -eq 1 ]; then
+    if [
+    "$LOCKED" -eq 1
+  ]; then
         rm -rf "$LOCK_DIR"
     fi
 
@@ -100,10 +117,10 @@ trap 'exit 143' TERM
 # Bootstrap
 # ============================================================
 bootstrap() {
-    info "检查运行环境..."
-
-    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"
-    [ -f /etc/alpine-release ] || die "此脚本仅支持 Alpine Linux"
+    info "检查运行环境..."[
+    "$(id -u)" -eq 0
+  ] || die "请使用 root 运行"[ -f /etc/alpine-release
+  ] || die "此脚本仅支持 Alpine Linux"
 
     command -v apk >/dev/null 2>&1 || \
         die "未找到 Alpine apk 包管理器"
@@ -124,7 +141,9 @@ bootstrap() {
         fi
     done
 
-    if [ "${#packages[@]}" -gt 0 ]; then
+    if [
+    "${#packages[@]}" -gt 0
+  ]; then
         info "安装缺失依赖: ${packages[*]}"
 
         apk add --no-cache "${packages[@]}" || \
@@ -148,7 +167,7 @@ acquire_lock() {
 
     mkdir -p /run
 
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    if ! mkdir "$LOCK_DIR"2>/dev/null; then
         die "另一个安装任务可能正在运行。请检查锁目录: $LOCK_DIR"
     fi
 
@@ -219,9 +238,13 @@ available_bytes() {
     local path="$1"
     local kb
 
-    kb="$(df -Pk "$path" | awk 'END {print $4}')"
-
-    [[ "$kb" =~ ^[0-9]+$ ]] || \
+    kb="$(df -Pk "$path" | awk 'END {print $4}')"[
+    [
+      "$kb" =~ ^[
+        0-9
+      ]+$
+    ]
+  ] || \
         die "无法读取磁盘剩余空间: $path"
 
     printf '%s\n' "$((kb * 1024))"
@@ -236,9 +259,9 @@ check_disk_space() {
 
     info "磁盘检查: $path"
     info "需要空间: $((required / 1024 / 1024)) MB"
-    info "可用空间: $((available / 1024 / 1024)) MB"
-
-    [ "$available" -ge "$required" ] || \
+    info "可用空间: $((available / 1024 / 1024)) MB"[
+    "$available" -ge "$required"
+  ] || \
         die "磁盘空间不足: $path"
 }
 
@@ -263,7 +286,7 @@ http_get() {
 fetch_release() {
     info "获取 GitHub 最新稳定版..."
 
-    http_get "$API" "$META" || \
+    http_get "$API""$META" || \
         die "获取 GitHub Release 失败"
 
     RELEASE="$(jq -er '
@@ -279,9 +302,9 @@ fetch_release() {
     local count expected_url
 
     count="$(jq --arg name "$ASSET" \
-        '[.assets[] | select(.name == $name)] | length' "$META")"
-
-    [ "$count" = "1" ] || \
+        '[.assets[] | select(.name == $name)
+  ] | length' "$META")"["$count" = "1"
+] || \
         die "未找到对应架构的官方安装包: $ASSET"
 
     URL="$(jq -er --arg name "$ASSET" \
@@ -296,18 +319,27 @@ fetch_release() {
         '.assets[] | select(.name == $name) | .size' \
         "$META")" || die "无法读取安装包大小"
 
-    expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
-
-    [ "$URL" = "$expected_url" ] || \
-        die "下载地址验证失败"
-
-    [[ "$EXPECTED_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || \
-        die "官方 SHA256 格式无效"
-
-    [[ "$ASSET_SIZE" =~ ^[0-9]+$ ]] || \
-        die "安装包大小无效"
-
-    [ "$ASSET_SIZE" -gt 0 ] || \
+    expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"[
+  "$URL" = "$expected_url"
+] || \
+        die "下载地址验证失败"[
+  [
+    "$EXPECTED_DIGEST" =~ ^sha256: [a-fA-F0-9
+    ]{
+      64
+    }$
+  ]
+] || \
+        die "官方 SHA256 格式无效"[
+  [
+    "$ASSET_SIZE" =~ ^[
+      0-9
+    ]+$
+  ]
+] || \
+        die "安装包大小无效"[
+  "$ASSET_SIZE" -gt 0
+] || \
         die "安装包大小为零"
 
     EXPECTED_DIGEST="${EXPECTED_DIGEST#sha256:}"
@@ -349,19 +381,22 @@ download_release() {
         info "下载尝试 ${attempt}/${MAX_RETRIES}"
 
         if download_once; then
-            current_size="$(wc -c < "$ARCHIVE")"
-
-            [ "$current_size" -eq "$ASSET_SIZE" ] && break
+            current_size="$(wc -c < "$ARCHIVE")"[
+  "$current_size" -eq "$ASSET_SIZE"
+] && break
         fi
 
         current_size="$(wc -c < "$ARCHIVE" 2>/dev/null || printf '0')"
 
-        if [ "$current_size" -gt "$ASSET_SIZE" ]; then
-            rm -f "$ARCHIVE"
-            : > "$ARCHIVE"
+        if [
+  "$current_size" -gt "$ASSET_SIZE"
+]; then
+            rm -f "$ARCHIVE": > "$ARCHIVE"
         fi
 
-        if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+        if [
+  "$attempt" -lt "$MAX_RETRIES"
+]; then
             warn "下载中断，保留已下载部分并重试"
             sleep "$((attempt * 2))"
         fi
@@ -369,7 +404,9 @@ download_release() {
 
     current_size="$(wc -c < "$ARCHIVE")"
 
-    if [ "$current_size" -ne "$ASSET_SIZE" ]; then
+    if [
+  "$current_size" -ne "$ASSET_SIZE"
+]; then
         warn "续传未完成，尝试重新下载..."
 
         rm -f "$ARCHIVE"
@@ -386,9 +423,9 @@ download_release() {
             die "重新下载失败"
     fi
 
-    current_size="$(wc -c < "$ARCHIVE")"
-
-    [ "$current_size" -eq "$ASSET_SIZE" ] || \
+    current_size="$(wc -c < "$ARCHIVE")"[
+  "$current_size" -eq "$ASSET_SIZE"
+] || \
         die "安装包大小不匹配"
 
     ok "下载完成"
@@ -402,9 +439,9 @@ verify_archive() {
 
     local actual
 
-    actual="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
-
-    [ "${actual,,}" = "${EXPECTED_DIGEST,,}" ] || \
+    actual="$(sha256sum "$ARCHIVE" | awk '{print $1}')"[
+  "${actual,,}" = "${EXPECTED_DIGEST,,}"
+] || \
         die "SHA256 校验失败，拒绝安装"
 
     ok "SHA256 校验通过"
@@ -421,30 +458,27 @@ extract_binary() {
     tar -tzf "$ARCHIVE" > "$TMP/archive.list" || \
         die "压缩包目录读取失败"
 
-    grep -Fxq "$ENTRY" "$TMP/archive.list" || \
+    grep -Fxq "$ENTRY""$TMP/archive.list" || \
         die "压缩包中没有找到目标二进制"
 
     info "提取 sing-box..."
 
     tar -xzf "$ARCHIVE" -O "$ENTRY" > "$OUT" || \
-        die "提取二进制失败"
-
-    [ -s "$OUT" ] || \
+        die "提取二进制失败"[ -s "$OUT"
+] || \
         die "提取的二进制为空"
 
-    chmod 755 "$OUT"
-
-    "$OUT" version >/dev/null 2>&1 || \
+    chmod 755 "$OUT""$OUT" version >/dev/null 2>&1 || \
         die "二进制无法运行，可能存在架构或 musl 兼容问题"
 
     local actual_version
 
     actual_version="$("$OUT" version 2>/dev/null |
-        sed -n 's/^sing-box version \([^ ]*\).*/\1/p' |
+        sed -n 's/^sing-box version \([^
+]*\).*/\1/p' |
         head -n 1
-    )"
-
-    [ "$actual_version" = "$VERSION" ] || \
+    )"["$actual_version" = "$VERSION"
+] || \
         die "二进制版本验证失败"
 
     ok "二进制结构和版本验证通过"
@@ -460,7 +494,8 @@ install_preflight() {
 
     new_size="$(wc -c < "$OUT")"
 
-    if [ -f "$DEST" ]; then
+    if [ -f "$DEST"
+]; then
         old_size="$(wc -c < "$DEST")"
     fi
 
@@ -468,7 +503,7 @@ install_preflight() {
 
     info "检查安装目录空间..."
 
-    check_disk_space "$(dirname "$DEST")" "$required"
+    check_disk_space "$(dirname "$DEST")""$required"
 
     ok "安装目录空间充足"
 }
@@ -483,45 +518,47 @@ initialize_config() {
     chown root:root "$CONFIG_DIR"
     chmod 755 "$CONFIG_DIR"
 
-    if [ -L "$CONFIG" ]; then
+    if [ -L "$CONFIG"
+]; then
         die "配置文件路径是符号链接，拒绝覆盖: $CONFIG"
     fi
 
-    if [ -e "$CONFIG" ] && [ ! -f "$CONFIG" ]; then
+    if [ -e "$CONFIG"
+] && [ ! -f "$CONFIG"
+]; then
         die "配置文件路径存在但不是普通文件: $CONFIG"
     fi
 
-    if [ ! -f "$CONFIG" ]; then
+    if [ ! -f "$CONFIG"
+]; then
         info "生成默认 config.json..."
 
         CONFIG_TMP="$(mktemp "$CONFIG_DIR/.config.json.XXXXXX")"
 
         cat > "$CONFIG_TMP" <<'JSON'
 {
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "final": "direct"
+"log": {
+  "level": "info",
+  "timestamp": true
+},
+"inbounds": [],
+"outbounds": [
+  {
+    "type": "direct",
+    "tag": "direct"
   }
+],
+"route": {
+  "final": "direct"
+}
 }
 JSON
 
         chown root:root "$CONFIG_TMP"
-        chmod 600 "$CONFIG_TMP"
-
-        "$DEST" check -c "$CONFIG_TMP" || \
+        chmod 600 "$CONFIG_TMP""$DEST" check -c "$CONFIG_TMP" || \
             die "默认配置校验失败"
 
-        mv -f "$CONFIG_TMP" "$CONFIG"
+        mv -f "$CONFIG_TMP""$CONFIG"
         CONFIG_TMP=""
 
         ok "config.json 创建成功"
@@ -530,9 +567,7 @@ JSON
     fi
 
     chown root:root "$CONFIG"
-    chmod 600 "$CONFIG"
-
-    "$DEST" check -c "$CONFIG" || \
+    chmod 600 "$CONFIG""$DEST" check -c "$CONFIG" || \
         die "sing-box 配置文件校验失败"
 
     ok "配置文件校验通过"
@@ -544,11 +579,13 @@ JSON
 install_binary() {
     info "开始安装..."
 
-    if [ -e "$DEST" ]; then
-        [ -f "$DEST" ] || \
+    if [ -e "$DEST"
+]; then
+        [ -f "$DEST"
+] || \
             die "目标路径存在，但不是普通文件"
 
-        cp -p "$DEST" "$BACKUP" || \
+        cp -p "$DEST""$BACKUP" || \
             die "备份旧版本失败"
 
         HAD_OLD=1
@@ -556,18 +593,16 @@ install_binary() {
         ok "旧版本备份完成"
     fi
 
-    cp "$OUT" "$NEW" || \
+    cp "$OUT""$NEW" || \
         die "复制新版本失败"
 
-    chmod 755 "$NEW"
-
-    "$NEW" version >/dev/null 2>&1 || \
+    chmod 755 "$NEW""$NEW" version >/dev/null 2>&1 || \
         die "安装前二次验证失败"
 
     # 启用失败回滚
     ROLLBACK_ACTIVE=1
 
-    mv -f "$NEW" "$DEST" || \
+    mv -f "$NEW""$DEST" || \
         die "替换 sing-box 二进制失败"
 
     ok "sing-box 二进制已安装"
@@ -584,6 +619,64 @@ install_binary() {
 }
 
 # ============================================================
+# OpenRC service configuration
+# ============================================================
+configure_openrc_service() {
+    info "正在配置 OpenRC 服务..."
+
+    if [ ! -d /etc/init.d
+]; then
+        mkdir -p /etc/init.d
+    fi
+
+    cat > /etc/init.d/sing-box <<'EOF'
+#!/sbin/openrc-run
+
+name="sing-box"
+description="sing-box service"
+
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+
+pidfile="/run/${RC_SVCNAME}.pid"
+
+directory="/etc/sing-box"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -x "$command"
+]; then
+        eerror "sing-box binary not found: $command"
+        return 1
+    fi
+
+    if [ ! -f /etc/sing-box/config.json
+]; then
+        eerror "Configuration file not found"
+        return 1
+    fi
+
+    "$command" check -c /etc/sing-box/config.json
+}
+EOF
+
+    chmod 755 /etc/init.d/sing-box
+
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update add sing-box default
+    else
+        warn "未找到 rc-update，跳过开机启动设置"
+    fi
+
+    ok "OpenRC 服务配置完成（尚未启动）"
+}
+
+# ============================================================
 # Main
 # ============================================================
 main() {
@@ -597,6 +690,7 @@ main() {
     extract_binary
     install_preflight
     install_binary
+    configure_openrc_service
 
     echo "--------------------------------"
     echo "脚本版本: $VERSION_SCRIPT"
@@ -608,9 +702,7 @@ main() {
     echo "文件权限: 600 (root:root)"
     echo "SHA256: OK"
     echo "配置校验: OK"
-    echo "--------------------------------"
-
-    "$DEST" version
+    echo "--------------------------------""$DEST" version
 
     echo
     ok "安装完成！没有自动启动服务。"
