@@ -618,63 +618,7 @@ install_binary() {
     ok "sing-box 安装及配置初始化完成"
 }
 
-# ============================================================
-# OpenRC service configuration
-# ============================================================
-configure_openrc_service() {
-    info "正在配置 OpenRC 服务..."
 
-    if [ ! -d /etc/init.d
-]; then
-        mkdir -p /etc/init.d
-    fi
-
-    cat > /etc/init.d/sing-box <<'EOF'
-#!/sbin/openrc-run
-
-name="sing-box"
-description="sing-box service"
-
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-
-pidfile="/run/${RC_SVCNAME}.pid"
-
-directory="/etc/sing-box"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ ! -x "$command"
-]; then
-        eerror "sing-box binary not found: $command"
-        return 1
-    fi
-
-    if [ ! -f /etc/sing-box/config.json
-]; then
-        eerror "Configuration file not found"
-        return 1
-    fi
-
-    "$command" check -c /etc/sing-box/config.json
-}
-EOF
-
-    chmod 755 /etc/init.d/sing-box
-
-    if command -v rc-update >/dev/null 2>&1; then
-        rc-update add sing-box default
-    else
-        warn "未找到 rc-update，跳过开机启动设置"
-    fi
-
-    ok "OpenRC 服务配置完成（尚未启动）"
-}
 
 # ============================================================
 # Main
@@ -690,7 +634,7 @@ main() {
     extract_binary
     install_preflight
     install_binary
-    configure_openrc_service
+   
 
     echo "--------------------------------"
     echo "脚本版本: $VERSION_SCRIPT"
