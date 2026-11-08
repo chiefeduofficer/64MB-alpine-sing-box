@@ -615,4 +615,77 @@ main() {
     ok "V3 安装流程全部完成"
 }
 
+
+# ============================================================
+# Bootstrap: install dependencies automatically
+# ============================================================
+
+bootstrap() {
+    echo
+    echo "========================================"
+    echo " Alpine sing-box Lite Installer V3"
+    echo "========================================"
+
+    [ "$(id -u)" -eq 0 ] || {
+        echo "[ERROR] 请使用 root 执行"
+        exit 1
+    }
+
+    [ -f /etc/alpine-release ] || {
+        echo "[ERROR] 仅支持 Alpine Linux"
+        exit 1
+    }
+
+    echo "[INFO] 检查并安装依赖..."
+
+    if ! command -v apk >/dev/null 2>&1; then
+        echo "[ERROR] 未找到 apk"
+        exit 1
+    fi
+
+    REQUIRED_PACKAGES="bash curl jq tar coreutils"
+
+    MISSING=""
+
+    for pkg in $REQUIRED_PACKAGES; do
+        case "$pkg" in
+            bash)      cmd=bash ;;
+            curl)      cmd=curl ;;
+            jq)        cmd=jq ;;
+            tar)       cmd=tar ;;
+            coreutils) cmd=sha256sum ;;
+        esac
+
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            MISSING="$MISSING $pkg"
+        fi
+    done
+
+    if [ -n "$MISSING" ]; then
+        echo "[INFO] 安装缺失依赖:$MISSING"
+
+        apk add --no-cache $MISSING || {
+            echo "[ERROR] 依赖安装失败"
+            exit 1
+        }
+    fi
+
+    echo "[OK] 依赖检查完成"
+
+    # Re-execute using Bash when invoked through sh.
+    if [ -z "${BASH_VERSION:-}" ]; then
+        exec bash "$0" "$@"
+    fi
+
+    # Verify complete script syntax.
+    bash -n "$0" || {
+        echo "[ERROR] 脚本语法检查失败"
+        exit 1
+    }
+
+    echo "[OK] Bash 语法检查通过"
+}
+
+bootstrap "$@"
 main "$@"
+
