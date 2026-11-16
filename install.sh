@@ -67,6 +67,19 @@ warn() {
 err() {
     log "[ERROR] $*" >&2
 }
+# 兼容旧版日志函数名称
+log_info() {
+    info "$@"
+}
+
+log_ok() {
+    ok "$@"
+}
+
+log_error() {
+    err "$@"
+}
+
 
 die() {
     err "$*"
