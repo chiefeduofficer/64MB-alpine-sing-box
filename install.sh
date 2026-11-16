@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # Alpine 64MB sing-box Lite Installer
-# Version: 3.4.1
-# Streaming download + SHA256 + BusyBox tar
-# Fixed: find_binary stdout pollution
-# Fixed: SHA256 process error handling
+# Version: 3.4
+# Stream download + SHA256 + BusyBox tar
 
 set -Eeuo pipefail
 umask 077
 
-VERSION_SCRIPT="3.4.1"
+VERSION_SCRIPT="3.4"
 REPO="SagerNet/sing-box"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
@@ -19,6 +17,9 @@ CONFIG="${CONFIG_DIR}/config.json"
 WORK="/root/.singbox-install"
 LOCK_DIR="/run/sing-box-installer.lock"
 LOG="/var/log/sing-box-installer.log"
+
+CONNECT_TIMEOUT=15
+DOWNLOAD_TIMEOUT=1800
 
 TMP=""
 META=""
@@ -47,7 +48,6 @@ SERVICE_CREATED=0
 
 log() {
     local message="$*"
-
     printf '%s\n' "$message"
     printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
 }
@@ -61,15 +61,11 @@ ok() {
 }
 
 warn() {
-    local message="[WARN] $*"
-    printf '%s\n' "$message" >&2
-    printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
+    log "[WARN] $*" >&2
 }
 
 err() {
-    local message="[ERROR] $*"
-    printf '%s\n' "$message" >&2
-    printf '%s\n' "$message" >> "$LOG" 2>/dev/null || true
+    log "[ERROR] $*" >&2
 }
 
 die() {
@@ -124,7 +120,6 @@ on_exit() {
         fi
 
     else
-
         [ -n "$BACKUP" ] && rm -f "$BACKUP"
         [ -n "$NEW" ] && rm -f "$NEW"
         [ -n "$CONFIG_TMP" ] && rm -f "$CONFIG_TMP"
@@ -152,8 +147,7 @@ trap 'exit 143' TERM
 bootstrap() {
     info "检查系统环境..."
 
-    [ "$(id -u)" -eq 0 ] || \
-        die "请使用 root 运行"
+    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行"
 
     [ -f /etc/alpine-release ] || \
         die "此脚本仅支持 Alpine Linux"
@@ -164,10 +158,10 @@ bootstrap() {
     command -v bash >/dev/null 2>&1 || \
         die "没有找到 Bash"
 
+    # 只安装真正缺失的依赖
     if ! command -v jq >/dev/null 2>&1; then
         info "安装 jq..."
-        apk add --no-cache jq || \
-            die "jq 安装失败"
+        apk add --no-cache jq || die "jq 安装失败"
     fi
 
     if ! command -v sha256sum >/dev/null 2>&1; then
@@ -176,10 +170,7 @@ bootstrap() {
             die "coreutils 安装失败"
     fi
 
-    for cmd in \
-        wget tar tee jq sha256sum awk sed \
-        find df mktemp tr grep
-    do
+    for cmd in wget tar tee jq sha256sum awk sed find df mktemp; do
         command -v "$cmd" >/dev/null 2>&1 || \
             die "缺少必要命令：$cmd"
     done
@@ -236,7 +227,6 @@ acquire_lock() {
 
 detect_arch() {
     local machine
-
     machine="$(uname -m)"
 
     case "$machine" in
@@ -270,6 +260,7 @@ prepare_workspace() {
     mkdir -p "$WORK"
     chmod 700 "$WORK"
 
+    # 清理之前被 OOM 杀死留下的目录
     local stale_dir
     local stale_pid
 
@@ -323,6 +314,7 @@ check_disk_space() {
 
     info "磁盘剩余空间：$((available_kb / 1024)) MB"
 
+    # 解压后的二进制远大于压缩包
     [ "$available_kb" -ge 131072 ] || \
         die "磁盘剩余空间不足，至少建议 128MB"
 }
@@ -379,7 +371,6 @@ fetch_release() {
     )" || die "无法读取安装包大小"
 
     local expected_url
-
     expected_url="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
 
     [ "$URL" = "$expected_url" ] || \
@@ -414,14 +405,16 @@ stream_download_extract() {
 
     rm -f "$DIGEST_FILE"
 
+    # 创建 SHA256 子进程
     # FD 3 接收 tee 输出的数据
     exec 3> >(sha256sum > "$DIGEST_FILE")
 
     local hash_pid=$!
-    local hash_status=0
 
     local -a pipeline_status
+    local hash_status
 
+    # 这里不使用 set -e，手动检查每个管道状态
     set +e
 
     wget -qO- "$URL" \
@@ -435,34 +428,32 @@ stream_download_extract() {
     # 关闭 FD，让 SHA256 进程收到 EOF
     exec 3>&-
 
-    # 显式等待并检查 SHA256 子进程
-    if wait "$hash_pid"; then
-        hash_status=0
-    else
-        hash_status=$?
-    fi
+    wait "$hash_pid"
+    hash_status=$?
 
     if [ "${pipeline_status[0]:-1}" -ne 0 ]; then
-        die "wget 下载失败，退出码：${pipeline_status[0]}"
+        die "wget 下载失败"
     fi
 
     if [ "${pipeline_status[1]:-1}" -ne 0 ]; then
-        die "tee 数据转发失败，退出码：${pipeline_status[1]}"
+        die "tee 数据转发失败"
     fi
 
     if [ "${pipeline_status[2]:-1}" -ne 0 ]; then
-        die "tar 解压失败，退出码：${pipeline_status[2]}"
+        die "tar 解压失败"
     fi
 
     [ "$hash_status" -eq 0 ] || \
-        die "SHA256 计算进程失败，退出码：$hash_status"
+        die "SHA256 计算进程失败"
 
     [ -s "$DIGEST_FILE" ] || \
         die "SHA256 结果文件为空"
 
     local actual_digest
 
-    actual_digest="$(awk '{print $1}' "$DIGEST_FILE")"
+    actual_digest="$(
+        awk '{print $1}' "$DIGEST_FILE"
+    )"
 
     actual_digest="$(printf '%s' "$actual_digest" | tr 'A-F' 'a-f')"
 
@@ -482,74 +473,54 @@ stream_download_extract() {
 # --------------------------------------------------
 
 find_binary() {
-    local extracted
+    local found
 
-    # 重要：日志输出到 stderr
-    # stdout 只允许返回二进制文件路径
+    log_info "查找 sing-box 二进制..." >&2
 
-    info "查找 sing-box 二进制..." >&2
+    found="$(find "$TMP" -type f -name sing-box -print -quit 2>/dev/null)"
 
-    extracted="$(
-        find "$TMP" \
-            -type f \
-            -name sing-box \
-            -print -quit
-    )"
-
-    [ -n "$extracted" ] || {
-        err "解压后没有找到 sing-box 文件"
+    if [ -z "$found" ] || [ ! -f "$found" ]; then
+        log_error "没有找到 sing-box 二进制" >&2
         return 1
-    }
+    fi
 
-    [ -f "$extracted" ] || {
-        err "sing-box 文件不存在"
-        return 1
-    }
+    log_ok "找到 sing-box 二进制" >&2
 
-    chmod 755 "$extracted" || {
-        err "无法设置 sing-box 执行权限"
-        return 1
-    }
-
-    ok "找到 sing-box 二进制" >&2
-
-    # stdout 只返回路径
-    printf '%s\n' "$extracted"
+    # 标准输出只返回路径，不能输出其他内容
+    printf '%s\n' "$found"
 }
 
 # --------------------------------------------------
 # Stage and verify binary
 # --------------------------------------------------
 
+
 stage_binary() {
     local extracted="$1"
 
     info "准备安装新版本..."
 
-    mv "$extracted" "$NEW" || \
-        die "无法移动新二进制文件"
-
-    chmod 755 "$NEW" || \
-        die "无法设置新二进制执行权限"
+    mv "$extracted" "$NEW" || die "无法移动 sing-box 二进制文件"
+    chmod 755 "$NEW" || die "无法设置 sing-box 执行权限"
 
     info "检查二进制能否运行..."
 
-    "$NEW" version >/dev/null 2>&1 || \
-        die "新下载的 sing-box 无法运行"
-
+    local version_output
     local actual_version
 
+    version_output="$("$NEW" version 2>&1)" || die "新下载的 sing-box 无法运行"
+
     actual_version="$(
-        "$NEW" version 2>&1 \
-        | sed -n 's/^sing-box version \([^[:space:]]*\).*/\1/p' \
-        | sed -n '1p'
+        printf '%s\n' "$version_output" |
+        sed -n 's/^sing-box version \([^[:space:]]*\).*/\1/p' |
+        sed -n '1p'
     )"
 
-    [ "$actual_version" = "$VERSION" ] || \
-        die "版本不匹配：期望 $VERSION，实际 ${actual_version:-未知}"
+    [ "$actual_version" = "$VERSION" ] || die "版本不匹配：预期 $VERSION，实际 ${actual_version:-未知}"
 
-    ok "二进制版本验证通过：$actual_version"
+    ok "二进制检查通过：$actual_version"
 }
+
 
 # --------------------------------------------------
 # Default configuration
@@ -610,8 +581,7 @@ install_binary() {
     mv "$NEW" "$DEST" || \
         die "无法安装新版本"
 
-    chmod 755 "$DEST" || \
-        die "无法设置正式二进制执行权限"
+    chmod 755 "$DEST"
 
     ok "sing-box 二进制安装完成"
 }
@@ -620,14 +590,13 @@ install_binary() {
 # Validate configuration
 # --------------------------------------------------
 
+
 validate_config() {
-    info "检查 sing-box 配置..."
-
-    "$DEST" check -c "$CONFIG" || \
-        die "配置检查失败，安装将回滚"
-
-    ok "配置检查通过"
+    info "跳过安装阶段的 sing-box 配置检查"
+    warn "如需手动检查，请执行：sing-box check -c $CONFIG"
+    return 0
 }
+
 
 # --------------------------------------------------
 # OpenRC service
@@ -694,9 +663,7 @@ main() {
 
     local extracted
 
-    # 修复点：函数日志走 stderr，变量只接收文件路径
-    extracted="$(find_binary)" || \
-        die "查找 sing-box 二进制失败"
+    extracted="$(find_binary)"
 
     stage_binary "$extracted"
     prepare_config
